@@ -1,0 +1,49 @@
+"""Minimal environment-driven ASGI launcher."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import Any
+
+import uvicorn
+from fastapi import FastAPI
+
+from dsh_base_agent.agent import Agent
+from dsh_base_agent.api import create_app
+from dsh_base_agent.control import ControlPlane
+from dsh_base_agent.runtime import RuntimeConfig
+
+
+def build_from_env() -> FastAPI:
+    workspace = Path(os.environ.get("DSH_BASE_AGENT_WORKSPACE", ".")).resolve()
+    control = ControlPlane(workspace=workspace, runtime=RuntimeConfig.from_env())
+    definitions = os.environ.get("DSH_BASE_AGENT_DEFINITIONS")
+    if definitions:
+        payload: Any = json.loads(Path(definitions).read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise ValueError("DSH_BASE_AGENT_DEFINITIONS must contain a JSON array")
+        for item in payload:
+            if not isinstance(item, dict):
+                raise ValueError("each Agent definition must be an object")
+            control.register(
+                Agent(
+                    name=str(item["name"]),
+                    version=str(item.get("version", "1.0.0")),
+                    prompt=str(item["prompt"]),
+                    skills=tuple(str(value) for value in item.get("skills", [])),
+                )
+            )
+    return create_app(control)
+
+
+def main() -> None:
+    uvicorn.run(
+        build_from_env(),
+        host=os.environ.get("DSH_BASE_AGENT_HOST", "127.0.0.1"),
+        port=int(os.environ.get("DSH_BASE_AGENT_PORT", "8000")),
+    )
+
+
+__all__ = ["build_from_env", "main"]

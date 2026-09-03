@@ -1,0 +1,4 @@
+
+  项目：dsh-demo:wq
+  目标：理解 DeepSeek Harness Python SDK
+  要求：用三条要点解释 workspace、dsh_home 和 session_idA

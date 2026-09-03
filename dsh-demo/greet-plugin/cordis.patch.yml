@@ -1,0 +1,5 @@
+ - insert:
+      - id: demo-greet-tool
+        name: dsh-demo-greet-plugin        
+        config:
+          template: '你好，{name}！'
