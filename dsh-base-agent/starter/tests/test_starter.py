@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Any, cast
 
+import deepseek_harness
 import pytest
 from dsh_base_agent import (
     AuthorizationDenied,
+    ControlStoreConfig,
+    PostgresControlStore,
     Principal,
     RuntimeConfig,
     ToolAuthorization,
@@ -16,6 +21,7 @@ from company_agent.authorization import StarterAuthorizer
 from company_agent.context import render_static_context, static_context_sections
 from company_agent.definition import build_agent
 from company_agent.tools import get_request_context, query_order
+from company_agent.worker import build_worker
 
 
 def _tool_context(*, tenant_id: str = "demo-tenant") -> ToolContext:
@@ -63,8 +69,76 @@ def test_application_factory_registers_agent_and_uses_starter_workspace(tmp_path
     app = create_starter_app(project_root=tmp_path, runtime=runtime)
 
     assert control.workspace == (tmp_path / "workspace").resolve()
+    assert control.auto_execute is True
     assert tuple(control.agents) == ("iris-assistant-1",)
     assert "/v1/runs" in {route.path for route in app.routes}
+
+
+def test_postgres_switches_api_to_submission_only_and_builds_worker(tmp_path) -> None:
+    runtime = RuntimeConfig(provider="test", model="test", dsh_home=tmp_path / "dsh-home")
+    store_config = ControlStoreConfig(database_url="postgresql://agent:secret@db/agent")
+
+    control = build_control(
+        project_root=tmp_path,
+        runtime=runtime,
+        store_config=store_config,
+    )
+
+    assert control.auto_execute is False
+    assert isinstance(control.store, PostgresControlStore)
+
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            (
+                "DSH_MODEL=test",
+                "DSH_BASE_AGENT_DATABASE_URL=postgresql://agent:secret@db/agent",
+            )
+        ),
+        encoding="utf-8",
+    )
+    worker = build_worker(project_root=tmp_path)
+
+    assert worker.control.auto_execute is False
+    assert isinstance(worker.control.store, PostgresControlStore)
+
+
+def test_worker_runtime_registers_the_control_workspace_skill_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            (
+                "DSH_MODEL=test",
+                "DSH_BASE_AGENT_DATABASE_URL=postgresql://agent:secret@db/agent",
+            )
+        ),
+        encoding="utf-8",
+    )
+    skill_root = tmp_path / "workspace" / ".dsh" / "skills"
+    skill_root.mkdir(parents=True)
+    captured: dict[str, Any] = {}
+
+    class FakeHarness:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(deepseek_harness, "DeepSeekHarness", FakeHarness)
+    worker = build_worker(project_root=tmp_path)
+    worker.control.runtime_factory.create(
+        build_agent(),
+        workspace=worker.control.workspace,
+        dsh_home=tmp_path / "dsh-home",
+        attempt_id="attempt-worker-1",
+        tool_gateway_url="http://127.0.0.1:1234/mcp",
+    )
+
+    patch_paths = cast(tuple[str, ...], captured["patches"])
+    patch = json.loads(Path(patch_paths[0]).read_text(encoding="utf-8"))
+    assert {
+        "id": "skill-filesystem",
+        "config": {"customSkillDirs": [str(skill_root.resolve())]},
+    } in patch
 
 
 async def test_tools_use_tenant_and_principal_context() -> None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dsh_base_agent import Agent
 
 from company_agent.context import render_static_context, static_context_sections
-from company_agent.tools import get_request_context, query_order
+from company_agent.tools import get_request_context, query_order, generate_large_report
 
 _BASE_PROMPT = """你是公司订单助手。
 
@@ -20,7 +20,7 @@ def build_agent() -> Agent:
         name="iris-assistant-1",
         version="1.0.0",
         prompt=f"{_BASE_PROMPT.strip()}\n\n{static_context}",
-        tools=(get_request_context, query_order),
+        tools=(get_request_context, query_order, generate_large_report),
         skills=("order-support",),
         permissions=frozenset({"orders:read", "context:read"}),
     )

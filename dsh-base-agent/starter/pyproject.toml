@@ -11,6 +11,7 @@ dependencies = [
 
 [project.scripts]
 company-agent-server = "company_agent.app:main"
+company-agent-worker = "company_agent.worker:main"
 
 [build-system]
 requires = ["hatchling>=1.27"]
@@ -47,4 +48,3 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 python_version = "3.12"
 strict = true
 packages = ["company_agent"]
-

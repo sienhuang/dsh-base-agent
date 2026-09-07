@@ -49,6 +49,21 @@ def get_request_context(context: ToolContext) -> dict[str, str]:
         **preferences,
     }
 
+@tool(side_effect=False, permissions=("orders:read",))
+def generate_large_report(context: ToolContext) -> dict[str, Any]:
+    """Generate a large report for testing ArtifactStore."""
 
-__all__ = ["get_request_context", "query_order"]
+    return {
+        "tenant_id": context.tenant_id,
+        "rows": [
+            {
+                "index": index,
+                "order_id": f"order-{index:05d}",
+                "detail": "用于测试 ArtifactStore 的订单明细" * 10,
+            }
+            for index in range(500)
+        ],
+    }
+
+__all__ = ["get_request_context", "query_order", "generate_large_report"]
 

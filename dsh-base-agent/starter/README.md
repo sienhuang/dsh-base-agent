@@ -13,6 +13,47 @@ uv sync --all-groups
 uv run company-agent-server
 ```
 
+默认使用 `workspace/.dsh-base-agent/control.db`。需要 PostgreSQL 时，在 `.env` 中增加：
+
+```dotenv
+DSH_BASE_AGENT_DATABASE_URL=postgresql://agent:secret@localhost:5432/dsh_base_agent
+DSH_BASE_AGENT_DATABASE_SCHEMA=dsh_base_agent
+```
+
+starter 启动器会通过 `ControlStoreConfig` 自动选择数据库；数据库配置不会进入 DSH
+`RuntimeConfig`。
+
+Tool 返回的 JSON 超过 64 KiB 时会自动保存为本地 Artifact，默认目录为
+`workspace/.dsh-base-agent/artifacts`。可以指定其他目录：
+
+```dotenv
+DSH_BASE_AGENT_ARTIFACT_LOCAL_ROOT=/shared-pvc/dsh-base-agent/artifacts
+```
+
+PostgreSQL API/Worker 分离时，该目录必须是 API 和所有 Worker 共同挂载的持久卷，否则 API
+可以查到 ArtifactRecord，但无法下载 Worker 所在节点上的正文。
+
+未配置 PostgreSQL 时，`company-agent-server` 保留 SQLite 进程内执行，方便本地开发。配置
+PostgreSQL 后，API 自动切换为只提交模式，还必须在另一个终端启动 Worker：
+
+```bash
+uv run company-agent-server
+uv run company-agent-worker
+```
+
+API 只写入 `QUEUED` Run；Worker 从 PostgreSQL 领取任务、维护 Lease/Heartbeat 并执行 DSH。
+不要在 PostgreSQL 模式下只启动 API，否则 Run 会一直保持 `queued`。
+
+需要把 DSH 原始 Notification 直接发送到 Kafka 时增加：
+
+```dotenv
+DSH_BASE_AGENT_KAFKA_BOOTSTRAP_SERVERS=localhost:9092
+DSH_BASE_AGENT_KAFKA_TOPIC=dsh.notifications.v1
+```
+
+Publisher 使用有界内存队列且不使用 Outbox。Kafka 默认是非必需依赖：发送失败会记录日志，
+不会让 Agent Run 失败；进程异常退出时允许丢失尚未发送的数据。
+
 提交一个 Run：
 
 ```bash
@@ -28,6 +69,18 @@ curl -X POST http://127.0.0.1:8000/v1/runs \
 
 ```bash
 curl http://127.0.0.1:8000/v1/runs/{run_id} \
+  -H 'X-Tenant-ID: demo-tenant' \
+  -H 'X-Principal-ID: demo-user'
+```
+
+查看和下载大 Tool Result：
+
+```bash
+curl http://127.0.0.1:8000/v1/runs/{run_id}/artifacts \
+  -H 'X-Tenant-ID: demo-tenant' \
+  -H 'X-Principal-ID: demo-user'
+
+curl -OJ http://127.0.0.1:8000/v1/runs/{run_id}/artifacts/{artifact_id}/content \
   -H 'X-Tenant-ID: demo-tenant' \
   -H 'X-Principal-ID: demo-user'
 ```
@@ -78,8 +131,10 @@ curl -sS http://127.0.0.1:8000/v1/conversations/{conversation_id}/runs \
   -H 'X-Principal-ID: demo-user'
 ```
 
-当前多轮能力依赖同一个 ControlPlane 进程中的存活 Runtime。服务重启后会把已打开过 DSH
-Session 的 Conversation 标为 `BLOCKED`，直到 DSH Resume 扩展实现。
+Conversation 的上下文归属于持久化的 `DSH_HOME + dsh_session_id`，不归属于某个 Worker。
+在 PostgreSQL Worker 模式下，替代 Worker 会使用同一组标识创建新的 Harness，并继续提交下
+一个 Turn；它不会自动重放被中断的 Run。Kubernetes 多 Worker 部署必须让 Worker 挂载同一
+份 DSH Home 持久卷。
 
 ## 目录
 
@@ -128,7 +183,10 @@ workspace/.dsh/skills/<skill-name>/SKILL.md
 skills=("order-support", "another-skill")
 ```
 
-Starter 使用 DSH 的项目级 Skill 目录约定，因此本地 Skill 可以被当前 workspace 发现。但
+base-agent 会把当前 ControlPlane 的 `workspace/.dsh/skills` 显式注册为 DSH 的
+`customSkillDirs`。这是必要的，因为 DSH 默认把最近的 Git 根目录作为项目根；当 workspace
+位于仓库的子目录（例如本 Starter）时，仅依赖项目级自动发现会扫描错误的目录。
+
 当前 base-agent 还不会安装远程 Skill、锁定版本或强制 allowlist；生产应用不能把
 `Agent.skills` 误当成完整的供应链治理。
 
@@ -145,10 +203,10 @@ Prompt。
 
 ## 当前限制
 
-- 单次 `/v1/runs` 仍使用独立 DSH Session；Conversation Run 在当前进程内串行复用 Session；
-- 已打开的 Conversation 暂不能跨 ControlPlane 重启恢复；
-- SQLite 只适用于单进程；
+- 单次 `/v1/runs` 仍使用独立 DSH Session；Conversation Run 串行复用持久化 Session；
+- PostgreSQL 模式支持替代 Worker 使用共享 DSH Home 接收 Conversation 的下一个 Turn；
+- SQLite 只适用于单进程；PostgreSQL Worker 已具备第一版 lease/heartbeat/fencing；
 - Workspace 是本地目录，尚未接入 S3 materialize/commit；
-- Artifact 自动收集尚未实现；
+- Tool JSON 大结果已自动写 LocalArtifactStore；S3、容量配额和 TTL 尚未实现；
 - `resume` 受当前 DSH SDK 能力限制；
 - 示例 Authorizer 和内存订单数据仅用于演示，必须由业务实现替换。
