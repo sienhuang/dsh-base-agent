@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 from dsh_base_agent.control.auth import (
     AuthorizationDenied,
     Authorizer,
+    MemoryAuthorization,
     Principal,
     ReadOnlyByDefaultAuthorizer,
     ToolAuthorization,
@@ -75,6 +76,7 @@ __all__ = [
     "ControlPlane",
     "DispatchState",
     "EventSource",
+    "MemoryAuthorization",
     "Principal",
     "ReadOnlyByDefaultAuthorizer",
     "RunAccessDenied",

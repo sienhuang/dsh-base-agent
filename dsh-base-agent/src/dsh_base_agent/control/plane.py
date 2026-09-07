@@ -10,6 +10,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from dsh_base_agent.adapters.dsh.context_gateway import (
+    MemoryContextGateway,
+    MemoryRunContext,
+)
 from dsh_base_agent.adapters.dsh.runtime import (
     DshNotificationHandler,
     DshRuntime,
@@ -89,7 +93,8 @@ class RunView:
 @dataclass(slots=True)
 class _ConversationRuntimeHolder:
     runtime: DshRuntime
-    gateway: ToolGateway | None
+    tool_gateway: ToolGateway | None
+    memory_gateway: MemoryContextGateway | None
     agent_fingerprint: str
     dsh_session_id: str
 
@@ -199,7 +204,16 @@ class ControlPlane:
         self._active_runtimes.clear()
         self._conversation_runtimes.clear()
         await asyncio.gather(
-            *(holder.gateway.close() for holder in holders if holder.gateway is not None),
+            *(
+                holder.tool_gateway.close()
+                for holder in holders
+                if holder.tool_gateway is not None
+            ),
+            *(
+                holder.memory_gateway.close()
+                for holder in holders
+                if holder.memory_gateway is not None
+            ),
             return_exceptions=True,
         )
         for event in self._run_done.values():
@@ -838,6 +852,7 @@ class ControlPlane:
         attempt: RunAttempt | None = None
         run: RunRecord | None = None
         gateway: ToolGateway | None = None
+        memory_gateway: MemoryContextGateway | None = None
         runtime: DshRuntime | None = None
         try:
             lock = self._run_locks.setdefault(run_id, asyncio.Lock())
@@ -960,6 +975,24 @@ class ControlPlane:
                         attempt_id=attempt.attempt_id,
                     )
                 )
+            if agent.memory_providers:
+                memory_gateway = MemoryContextGateway(
+                    agent=agent,
+                    authorizer=self.authorizer,
+                    write_event=write_event,
+                    write_audit=write_audit,
+                )
+                await memory_gateway.start()
+                memory_gateway.bind(
+                    MemoryRunContext(
+                        principal=Principal(run.tenant_id, run.principal_id),
+                        conversation_id=None,
+                        run_id=run_id,
+                        attempt_id=attempt.attempt_id,
+                        dsh_session_id=attempt.dsh_session_id,
+                        query=run.input,
+                    )
+                )
             dsh_home = self._agent_dsh_home(run.agent_fingerprint)
             runtime = self.runtime_factory.create(
                 agent,
@@ -967,6 +1000,12 @@ class ControlPlane:
                 dsh_home=dsh_home,
                 attempt_id=attempt.attempt_id,
                 tool_gateway_url=gateway.url if gateway is not None else None,
+                memory_context_url=(
+                    memory_gateway.url if memory_gateway is not None else None
+                ),
+                memory_context_token=(
+                    memory_gateway.token if memory_gateway is not None else None
+                ),
             )
             self._active_runtimes[run_id] = runtime
             await self._set_dispatch_state(
@@ -1033,6 +1072,10 @@ class ControlPlane:
                 if attempt is not None:
                     gateway.release(attempt.attempt_id)
                 await gateway.close()
+            if memory_gateway is not None:
+                if attempt is not None:
+                    memory_gateway.release(attempt.attempt_id)
+                await memory_gateway.close()
 
     async def _execute_conversation_run(
         self,
@@ -1162,8 +1205,8 @@ class ControlPlane:
                 agent,
                 attempt.attempt_id,
             )
-            if holder.gateway is not None:
-                holder.gateway.bind(
+            if holder.tool_gateway is not None:
+                holder.tool_gateway.bind(
                     GatewayRunContext(
                         principal=Principal(run.tenant_id, run.principal_id),
                         run_id=run_id,
@@ -1172,6 +1215,20 @@ class ControlPlane:
                     write_event=write_event,
                     write_audit=write_audit,
                     write_artifact=write_artifact,
+                )
+                gateway_bound = True
+            if holder.memory_gateway is not None:
+                holder.memory_gateway.bind(
+                    MemoryRunContext(
+                        principal=Principal(run.tenant_id, run.principal_id),
+                        conversation_id=conversation.conversation_id,
+                        run_id=run_id,
+                        attempt_id=attempt.attempt_id,
+                        dsh_session_id=conversation.dsh_session_id,
+                        query=run.input,
+                    ),
+                    write_event=write_event,
+                    write_audit=write_audit,
                 )
                 gateway_bound = True
             self._active_runtimes[run_id] = holder.runtime
@@ -1239,9 +1296,12 @@ class ControlPlane:
             return False
         finally:
             self._active_runtimes.pop(run_id, None)
-            if gateway_bound and holder is not None and holder.gateway is not None:
+            if gateway_bound and holder is not None and holder.tool_gateway is not None:
                 if attempt is not None:
-                    holder.gateway.release(attempt.attempt_id)
+                    holder.tool_gateway.release(attempt.attempt_id)
+            if gateway_bound and holder is not None and holder.memory_gateway is not None:
+                if attempt is not None:
+                    holder.memory_gateway.release(attempt.attempt_id)
 
     async def _conversation_runtime_holder(
         self,
@@ -1259,24 +1319,40 @@ class ControlPlane:
             return existing
 
         gateway: ToolGateway | None = None
+        memory_gateway: MemoryContextGateway | None = None
         try:
             if agent.tools:
                 gateway = ToolGateway(agent=agent, authorizer=self.authorizer)
                 await gateway.start()
+            if agent.memory_providers:
+                memory_gateway = MemoryContextGateway(
+                    agent=agent,
+                    authorizer=self.authorizer,
+                )
+                await memory_gateway.start()
             runtime = self.runtime_factory.create(
                 agent,
                 workspace=self.workspace,
                 dsh_home=self._conversation_dsh_home(conversation.dsh_home_key),
                 attempt_id=attempt_id,
                 tool_gateway_url=gateway.url if gateway is not None else None,
+                memory_context_url=(
+                    memory_gateway.url if memory_gateway is not None else None
+                ),
+                memory_context_token=(
+                    memory_gateway.token if memory_gateway is not None else None
+                ),
             )
         except BaseException:
             if gateway is not None:
                 await gateway.close()
+            if memory_gateway is not None:
+                await memory_gateway.close()
             raise
         holder = _ConversationRuntimeHolder(
             runtime=runtime,
-            gateway=gateway,
+            tool_gateway=gateway,
+            memory_gateway=memory_gateway,
             agent_fingerprint=conversation.agent_fingerprint,
             dsh_session_id=conversation.dsh_session_id,
         )
@@ -1288,8 +1364,10 @@ class ControlPlane:
         if holder is None:
             return
         await holder.runtime.close()
-        if holder.gateway is not None:
-            await holder.gateway.close()
+        if holder.tool_gateway is not None:
+            await holder.tool_gateway.close()
+        if holder.memory_gateway is not None:
+            await holder.memory_gateway.close()
 
     async def _block_conversation(self, conversation_id: str, reason: str) -> None:
         conversation = await self.store.get_conversation(conversation_id)

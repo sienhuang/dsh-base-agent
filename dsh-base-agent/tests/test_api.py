@@ -39,8 +39,18 @@ class Factory:
         dsh_home: Path,
         attempt_id: str,
         tool_gateway_url: str | None,
+        memory_context_url: str | None = None,
+        memory_context_token: str | None = None,
     ) -> DshRuntime:
-        del agent, workspace, dsh_home, attempt_id, tool_gateway_url
+        del (
+            agent,
+            workspace,
+            dsh_home,
+            attempt_id,
+            tool_gateway_url,
+            memory_context_url,
+            memory_context_token,
+        )
         return Runtime()
 
 

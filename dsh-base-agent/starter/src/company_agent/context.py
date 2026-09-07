@@ -1,7 +1,8 @@
 """Application-owned Context extension points.
 
-Static, non-secret context is compiled into the Agent prompt. Tenant-specific or
-frequently changing context belongs behind a governed Tool; see ``tools.py``.
+Static, non-secret context is compiled into the Agent prompt. Model-selected
+dynamic lookups belong behind a governed Tool; automatic per-Turn retrieval belongs
+in a read-only Memory Provider; see ``tools.py`` and ``memory.py``.
 """
 
 from __future__ import annotations
@@ -44,4 +45,3 @@ def render_static_context(sections: tuple[StaticContextSection, ...]) -> str:
 
 
 __all__ = ["StaticContextSection", "render_static_context", "static_context_sections"]
-

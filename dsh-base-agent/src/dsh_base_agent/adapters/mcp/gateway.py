@@ -113,12 +113,17 @@ class ToolGateway:
         )
         self._uvicorn: uvicorn.Server | None = None
         self._serve_task: asyncio.Task[None] | None = None
-        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._socket.bind(("127.0.0.1", 0))
-        self._socket.listen(128)
-        self._socket.setblocking(False)
-        host, port = self._socket.getsockname()[:2]
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server_socket.bind(("127.0.0.1", 0))
+            server_socket.listen(128)
+            server_socket.setblocking(False)
+            host, port = server_socket.getsockname()[:2]
+        except BaseException:
+            server_socket.close()
+            raise
+        self._socket = server_socket
         self.url = f"http://{host}:{port}/mcp"
         self._register_handlers()
 

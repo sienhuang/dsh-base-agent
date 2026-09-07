@@ -9,6 +9,8 @@ import pytest
 from dsh_base_agent import (
     AuthorizationDenied,
     ControlStoreConfig,
+    MemoryAuthorization,
+    MemorySearchRequest,
     PostgresControlStore,
     Principal,
     RuntimeConfig,
@@ -20,6 +22,7 @@ from company_agent.app import build_control, create_starter_app
 from company_agent.authorization import StarterAuthorizer
 from company_agent.context import render_static_context, static_context_sections
 from company_agent.definition import build_agent
+from company_agent.memory import search_user_memory
 from company_agent.tools import get_request_context, query_order
 from company_agent.worker import build_worker
 
@@ -41,10 +44,15 @@ def test_agent_wires_tools_skill_and_static_context() -> None:
     agent = build_agent()
 
     assert agent.skills == ("order-support",)
-    assert [item.spec.name for item in agent.tools] == ["get_request_context", "query_order"]
+    assert [item.spec.name for item in agent.tools] == [
+        "get_request_context",
+        "query_order",
+        "generate_large_report",
+    ]
+    assert [provider.name for provider in agent.memory_providers] == ["user-memory"]
     assert "business-boundary" in agent.prompt
     assert "response-contract" in agent.prompt
-    assert agent.permissions == frozenset({"orders:read", "context:read"})
+    assert agent.permissions == frozenset({"orders:read", "context:read", "memory:read"})
 
 
 def test_skill_bundle_uses_dsh_project_convention() -> None:
@@ -131,6 +139,8 @@ def test_worker_runtime_registers_the_control_workspace_skill_root(
         dsh_home=tmp_path / "dsh-home",
         attempt_id="attempt-worker-1",
         tool_gateway_url="http://127.0.0.1:1234/mcp",
+        memory_context_url="http://127.0.0.1:1235/memory/context",
+        memory_context_token="test-token",
     )
 
     patch_paths = cast(tuple[str, ...], captured["patches"])
@@ -157,6 +167,24 @@ async def test_tools_use_tenant_and_principal_context() -> None:
     assert request_context["answer_style"] == "concise"
 
 
+async def test_memory_provider_uses_trusted_tenant_and_principal_context() -> None:
+    items = await search_user_memory.search(
+        MemorySearchRequest(
+            tenant_id="demo-tenant",
+            principal_id="demo-user",
+            agent_id="iris-assistant-1",
+            conversation_id="conversation-1",
+            run_id="run-1",
+            attempt_id="attempt-1",
+            dsh_session_id="session-1",
+            query="查询订单",
+        )
+    )
+
+    assert len(items) == 1
+    assert "demo-user" in items[0].content
+
+
 async def test_starter_authorizer_denies_unknown_tenant() -> None:
     agent = build_agent()
     authorizer = StarterAuthorizer()
@@ -174,5 +202,17 @@ async def test_starter_authorizer_denies_unknown_tenant() -> None:
                 attempt_id="attempt-1",
                 tool=query_order,
                 arguments={"order_id": "order-001"},
+            )
+        )
+
+    with pytest.raises(AuthorizationDenied):
+        await authorizer.authorize_memory(
+            MemoryAuthorization(
+                principal=principal,
+                agent=agent,
+                conversation_id=None,
+                run_id="run-1",
+                attempt_id="attempt-1",
+                provider=search_user_memory,
             )
         )

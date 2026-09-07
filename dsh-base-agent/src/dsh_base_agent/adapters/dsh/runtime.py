@@ -111,6 +111,8 @@ class DshRuntimeFactory(Protocol):
         dsh_home: Path,
         attempt_id: str,
         tool_gateway_url: str | None,
+        memory_context_url: str | None = None,
+        memory_context_token: str | None = None,
     ) -> DshRuntime: ...
 
 
@@ -134,6 +136,8 @@ class OfficialDshRuntimeFactory:
         dsh_home: Path,
         attempt_id: str,
         tool_gateway_url: str | None,
+        memory_context_url: str | None = None,
+        memory_context_token: str | None = None,
     ) -> DshRuntime:
         from deepseek_harness import DeepSeekHarness  # type: ignore[import-untyped]
 
@@ -145,6 +149,8 @@ class OfficialDshRuntimeFactory:
             dsh_home=resolved_home,
             attempt_id=attempt_id,
             tool_gateway_url=tool_gateway_url,
+            memory_context_url=memory_context_url,
+            memory_context_token=memory_context_token,
         )
         harness = DeepSeekHarness(
             dsh_home=str(resolved_home),

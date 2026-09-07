@@ -142,8 +142,9 @@ Conversation 的上下文归属于持久化的 `DSH_HOME + dsh_session_id`，不
 src/company_agent/
 ├── definition.py       Agent 组装入口
 ├── tools.py            Python Tool
+├── memory.py           只读 Memory Provider（替换为公司检索服务）
 ├── context.py          静态 Context
-├── authorization.py    Run/Tool 权限策略
+├── authorization.py    Run/Tool/Memory 权限策略
 └── app.py              ControlPlane 与 FastAPI 启动
 
 workspace/
@@ -190,16 +191,21 @@ base-agent 会把当前 ControlPlane 的 `workspace/.dsh/skills` 显式注册为
 当前 base-agent 还不会安装远程 Skill、锁定版本或强制 allowlist；生产应用不能把
 `Agent.skills` 误当成完整的供应链治理。
 
-## 添加 Context
+## 添加 Context 和 Memory
 
 静态、非敏感、随 Agent 版本发布的规则放在 `context.py`，它们会被确定性地组合进 Agent
 Prompt。
 
-租户数据、用户偏好和频繁变化的数据不要直接拼进静态 Prompt，应像
-`get_request_context` 一样封装成只读 Tool，通过 `ToolContext` 确定访问范围。
+只有模型按需决定是否查询的信息，才像 `get_request_context` 一样封装成只读 Tool，通过
+`ToolContext` 确定访问范围。
 
-当前核心 SDK 还没有正式的动态 `ContextProvider`，也没有把 DSH Plugin Context 纳入公司
-授权和审计。Starter 不伪造这两项能力。
+每个用户 Turn 都应该自动带入的个性化 Memory，使用 `memory.py` 中的
+`@memory_provider`。Starter 当前返回一条演示偏好；业务只需把函数体替换成公司 Memory/RAG
+服务调用，并继续使用 `MemorySearchRequest` 中由 ControlPlane 绑定的租户、Principal 和
+Conversation 身份。不要增加写入方法，Memory 写入由 Kafka 下游服务负责。
+
+Memory Provider 已纳入权限、超时、有界 Event/Audit 和 16 KiB 模型上下文总预算。详细约束
+见主项目的 [`docs/memory-retrieval.md`](../docs/memory-retrieval.md)。
 
 ## 当前限制
 

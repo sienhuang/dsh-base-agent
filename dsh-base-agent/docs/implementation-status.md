@@ -6,6 +6,9 @@
 
 - 不可变 `Agent` 定义和内容 fingerprint；
 - `@tool` 参数 Schema、校验、同步/异步调用和 `ToolContext` 注入；
+- `@memory_provider` 只读检索契约、可信身份 `MemorySearchRequest` 和结果校验；
+- DSH `agent/pre-step` Memory Plugin、认证 loopback Gateway、16 KiB 总预算和 fail-open；
+- Memory 权限、超时、摘要 Event/Audit，以及单 Turn 只检索一次；
 - Python Tool 到 loopback MCP Server；
 - Tool 超时、readiness、权限元数据、事件和审计；
 - DSH `sdk` Profile patch 编译和官方 Python SDK 适配；
@@ -30,8 +33,8 @@
 
 - Skill：名称进入 Agent fingerprint，并控制 DSH `tool-skill` 是否启用；没有安装、解析、
   版本锁定和严格 allowlist；
-- Context：可由应用组合进静态 Prompt，或通过受治理 Tool 获取动态信息；核心 SDK 没有
-  `ContextProvider`；
+- Context：可由应用组合进静态 Prompt，通过受治理 Tool 显式查询动态信息，或通过只读
+  Memory Provider 在 pre-step 自动检索；通用 `ContextProvider` 和多种注入策略尚未实现；
 - Authorization：有协议和安全默认值，尚未接公司 IAM/策略服务；
 - Artifact：本地后端已接通 Tool 大结果；S3、容量配额、TTL、孤儿扫描和模型按 chunk 读取
   尚未实现；
@@ -47,7 +50,7 @@
 
 - 更完整的 Worker 调度优先级、限流和跨机房治理；
 - S3 Workspace Backend、本地物化和版本提交；
-- DSH Plugin/Memory 的租户隔离、allowlist 与审计；
+- Memory 写入、生命周期治理、质量评估和外部服务可靠消费；
 - WAITING/Approval 的完整恢复流程；
 - 分布式配额和生产 SLA。
 

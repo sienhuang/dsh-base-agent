@@ -24,6 +24,7 @@ from dsh_base_agent.artifacts import (
 from dsh_base_agent.control.auth import (
     AuthorizationDenied,
     Authorizer,
+    MemoryAuthorization,
     Principal,
     ReadOnlyByDefaultAuthorizer,
     ToolAuthorization,
@@ -44,7 +45,20 @@ from dsh_base_agent.control.models import (
     WorkResourceType,
 )
 from dsh_base_agent.control.plane import ControlPlane, RunView
-from dsh_base_agent.sdk import Agent, FunctionTool, SideEffect, ToolContext, ToolReadiness, tool
+from dsh_base_agent.sdk import (
+    Agent,
+    FunctionMemoryProvider,
+    FunctionTool,
+    MemoryItem,
+    MemoryProvider,
+    MemoryReadiness,
+    MemorySearchRequest,
+    SideEffect,
+    ToolContext,
+    ToolReadiness,
+    memory_provider,
+    tool,
+)
 from dsh_base_agent.store import (
     ControlStore,
     ControlStoreConfig,
@@ -75,10 +89,16 @@ __all__ = [
     "DispatchState",
     "EventSource",
     "FunctionTool",
+    "FunctionMemoryProvider",
     "KafkaNotificationConfig",
     "KafkaNotificationPublisher",
     "LeaseLostError",
     "LocalArtifactStore",
+    "MemoryItem",
+    "MemoryAuthorization",
+    "MemoryProvider",
+    "MemoryReadiness",
+    "MemorySearchRequest",
     "NotificationPublisher",
     "NullNotificationPublisher",
     "Principal",
@@ -104,5 +124,6 @@ __all__ = [
     "create_app",
     "create_notification_publisher",
     "publish_notifications",
+    "memory_provider",
     "tool",
 ]

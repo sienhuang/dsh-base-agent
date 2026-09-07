@@ -63,8 +63,10 @@ class ToolCallingRuntimeFactory:
         dsh_home: Path,
         attempt_id: str,
         tool_gateway_url: str | None,
+        memory_context_url: str | None = None,
+        memory_context_token: str | None = None,
     ) -> DshRuntime:
-        del agent, workspace, dsh_home, attempt_id
+        del agent, workspace, dsh_home, attempt_id, memory_context_url, memory_context_token
         assert tool_gateway_url is not None
         self.runtime = ToolCallingRuntime(tool_gateway_url)
         return self.runtime
@@ -99,7 +101,7 @@ async def test_large_tool_result_is_stored_and_downloaded_through_owned_run(tmp_
     )
     completed = await control.wait(submitted.run_id)
 
-    assert completed.output == "report stored"
+    assert completed.output == "report stored", completed.error
     assert factory.runtime is not None
     assert factory.runtime.observation is not None
     assert factory.runtime.observation["externalized"] is True

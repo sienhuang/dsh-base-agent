@@ -10,6 +10,7 @@ src/dsh_base_agent/
 │   └── store.py                ArtifactStore 协议和 LocalArtifactStore
 ├── sdk/
 │   ├── agent.py                不可变 Agent 定义
+│   ├── memory.py               @memory_provider 和可信检索上下文
 │   └── tools.py                @tool、ToolContext 和 Tool 协议
 ├── control/
 │   ├── auth.py                 Principal、Authorizer 和权限请求
@@ -17,6 +18,8 @@ src/dsh_base_agent/
 │   └── plane.py                业务状态编排；不实现模型循环
 ├── adapters/
 │   ├── dsh/
+│   │   ├── context_gateway.py  Python Memory 到 pre-step 的认证 loopback 桥
+│   │   ├── memory_context_plugin.mjs  DSH agent/pre-step 插件
 │   │   ├── profile.py          Agent 定义到 DSH Profile patch
 │   │   └── runtime.py          官方 DSH Python SDK 窄适配
 │   ├── kafka/

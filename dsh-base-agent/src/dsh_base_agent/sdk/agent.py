@@ -7,6 +7,7 @@ import json
 import re
 from dataclasses import dataclass
 
+from dsh_base_agent.sdk.memory import MemoryProvider
 from dsh_base_agent.sdk.tools import Tool
 
 _NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -22,6 +23,7 @@ class Agent:
     skills: tuple[str, ...] = ()
     version: str = "1.0.0"
     permissions: frozenset[str] = frozenset()
+    memory_providers: tuple[MemoryProvider, ...] = ()
 
     def __post_init__(self) -> None:
         if not _NAME.fullmatch(self.name):
@@ -37,6 +39,9 @@ class Agent:
             raise ValueError("Agent skill names must not be blank")
         if len(self.skills) != len(set(self.skills)):
             raise ValueError("Agent skills must be unique")
+        provider_names = [item.name for item in self.memory_providers]
+        if len(provider_names) != len(set(provider_names)):
+            raise ValueError("Agent Memory Providers must have unique names")
         for item in self.tools:
             missing = item.permissions - self.permissions
             if missing:
@@ -44,11 +49,28 @@ class Agent:
                     f"Tool '{item.spec.name}' requires undeclared Agent permissions: "
                     f"{', '.join(sorted(missing))}"
                 )
+        for provider in self.memory_providers:
+            missing = provider.permissions - self.permissions
+            if missing:
+                raise ValueError(
+                    f"Memory Provider '{provider.name}' requires undeclared Agent permissions: "
+                    f"{', '.join(sorted(missing))}"
+                )
 
     @property
     def fingerprint(self) -> str:
         payload = {
             "name": self.name,
+            "memory_providers": [
+                {
+                    "max_results": item.max_results,
+                    "name": item.name,
+                    "permissions": sorted(item.permissions),
+                    "timeout_seconds": item.timeout_seconds,
+                    "version": item.version,
+                }
+                for item in self.memory_providers
+            ],
             "permissions": sorted(self.permissions),
             "prompt": self.prompt,
             "skills": list(self.skills),

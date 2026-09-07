@@ -6,6 +6,7 @@
 当前第一阶段提供：
 
 - 公司统一的 Python `Agent` / `@tool` SDK；
+- 只读 Python Memory Provider 到 DSH pre-step Context 的注入；
 - Python Tool 到 loopback MCP 的编译和治理边界；
 - 业务 Run、RunAttempt、DSH Session 映射；
 - 稳定的 FastAPI Run API；
@@ -21,7 +22,15 @@
 [`docs/code-layout.md`](docs/code-layout.md)。
 
 ```python
-from dsh_base_agent import Agent, ControlPlane, RuntimeConfig, tool
+from dsh_base_agent import (
+    Agent,
+    ControlPlane,
+    MemoryItem,
+    MemorySearchRequest,
+    RuntimeConfig,
+    memory_provider,
+    tool,
+)
 
 
 @tool(side_effect=False)
@@ -30,11 +39,18 @@ def query_order(order_id: str) -> dict[str, str]:
     return {"order_id": order_id, "status": "paid"}
 
 
+@memory_provider(permissions=("memory:read",), max_results=3)
+async def search_memory(request: MemorySearchRequest) -> list[MemoryItem]:
+    return await company_memory.search(request)
+
+
 agent = Agent(
     name="order-assistant",
     prompt="你是订单助手。",
     tools=(query_order,),
     skills=("order-support",),
+    memory_providers=(search_memory,),
+    permissions=frozenset({"memory:read"}),
 )
 
 control = ControlPlane(
@@ -45,6 +61,9 @@ control.register(agent)
 ```
 
 详细架构原则见上级目录的 `docs/dsh-base-agent-positioning.md`。
+
+只读 Memory 的身份边界、pre-step 流程、大小限制和 Kafka 写入端过滤规则见
+[`docs/memory-retrieval.md`](docs/memory-retrieval.md)。
 
 Conversation 持有 DSH Session、多个 Run 串行形成多轮对话的 v0.2 方案见
 [`docs/conversation-session-v0.2.md`](docs/conversation-session-v0.2.md)。该文档目前是设计草案，

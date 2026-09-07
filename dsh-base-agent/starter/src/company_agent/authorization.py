@@ -5,6 +5,7 @@ from __future__ import annotations
 from dsh_base_agent import (
     Agent,
     AuthorizationDenied,
+    MemoryAuthorization,
     Principal,
     SideEffect,
     ToolAuthorization,
@@ -19,7 +20,7 @@ class StarterAuthorizer:
     """
 
     _tenant_permissions = {
-        "demo-tenant": frozenset({"orders:read", "context:read"}),
+        "demo-tenant": frozenset({"orders:read", "context:read", "memory:read"}),
     }
 
     async def authorize_run(self, principal: Principal, agent: Agent) -> None:
@@ -37,6 +38,13 @@ class StarterAuthorizer:
                 f"missing Tool permissions: {', '.join(sorted(missing))}"
             )
 
+    async def authorize_memory(self, request: MemoryAuthorization) -> None:
+        granted = self._tenant_permissions.get(request.principal.tenant_id, frozenset())
+        missing = request.provider.permissions - granted
+        if missing:
+            raise AuthorizationDenied(
+                f"missing Memory permissions: {', '.join(sorted(missing))}"
+            )
+
 
 __all__ = ["StarterAuthorizer"]
-

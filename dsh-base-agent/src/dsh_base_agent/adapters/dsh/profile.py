@@ -46,9 +46,17 @@ class DshProfileCompiler:
         dsh_home: Path,
         attempt_id: str,
         tool_gateway_url: str | None,
+        memory_context_url: str | None = None,
+        memory_context_token: str | None = None,
     ) -> tuple[Path, ...]:
         if agent.tools and tool_gateway_url is None:
             raise ProfileCompilationError("Agent Tools require a loopback MCP gateway")
+        if agent.memory_providers and (
+            memory_context_url is None or memory_context_token is None
+        ):
+            raise ProfileCompilationError(
+                "Agent Memory Providers require an authenticated pre-step context gateway"
+            )
         patches: list[dict[str, object]] = [
             {"id": "system-prompt", "config": {"persona": agent.prompt}}
         ]
@@ -83,6 +91,24 @@ class DshProfileCompiler:
                     ]
                 }
             )
+        if memory_context_url is not None and memory_context_token is not None:
+            plugin = Path(__file__).with_name("memory_context_plugin.mjs").resolve()
+            patches.append(
+                {
+                    "insert": [
+                        {
+                            "id": "base-agent-memory-context",
+                            "name": plugin.as_uri(),
+                            "config": {
+                                "url": memory_context_url,
+                                "token": memory_context_token,
+                                "maxContextBytes": 16 * 1024,
+                                "timeoutMs": 10_000,
+                            },
+                        }
+                    ]
+                }
+            )
 
         patch_dir = dsh_home / "control-plane-patches"
         patch_dir.mkdir(parents=True, exist_ok=True)
@@ -99,10 +125,12 @@ class DshProfileCompiler:
 
 def _atomic_write(path: Path, content: str) -> None:
     if path.exists() and path.read_text(encoding="utf-8") == content:
+        os.chmod(path, 0o600)
         return
     temporary = path.with_suffix(f".{uuid4().hex}.tmp")
     try:
         with temporary.open("x", encoding="utf-8") as handle:
+            os.chmod(temporary, 0o600)
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
