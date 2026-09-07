@@ -35,7 +35,8 @@ src/dsh_base_agent/
 │   ├── service.py              PostgreSQL claim、lease、heartbeat 和执行
 │   └── server.py               独立 Worker 启动入口
 └── api/
-    ├── app.py                  稳定业务 HTTP 契约
+    ├── app.py                  稳定业务 HTTP 契约和统一 Principal 依赖
+    ├── authentication.py       开发 Header/MOA 请求认证和环境配置
     └── server.py               环境驱动的 ASGI 启动入口
 ```
 

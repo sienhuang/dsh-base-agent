@@ -7,10 +7,13 @@ from typing import Any, cast
 import deepseek_harness
 import pytest
 from dsh_base_agent import (
+    ApiAuthenticationConfig,
     AuthorizationDenied,
     ControlStoreConfig,
+    HeaderRequestAuthenticator,
     MemoryAuthorization,
     MemorySearchRequest,
+    MoaRequestAuthenticator,
     PostgresControlStore,
     Principal,
     RuntimeConfig,
@@ -80,6 +83,26 @@ def test_application_factory_registers_agent_and_uses_starter_workspace(tmp_path
     assert control.auto_execute is True
     assert tuple(control.agents) == ("iris-assistant-1",)
     assert "/v1/runs" in {route.path for route in app.routes}
+    assert isinstance(app.state.request_authenticator, HeaderRequestAuthenticator)
+
+
+async def test_application_factory_can_enable_moa_authentication(tmp_path: Path) -> None:
+    runtime = RuntimeConfig(provider="test", model="test", dsh_home=tmp_path / "dsh-home")
+    authentication = ApiAuthenticationConfig(
+        enabled=True,
+        tenant_id="demo-tenant",
+        moa_auth_url="https://login.moa.example",
+        moa_project_id=1564,
+    )
+
+    app = create_starter_app(
+        project_root=tmp_path,
+        runtime=runtime,
+        authentication_config=authentication,
+    )
+
+    assert isinstance(app.state.request_authenticator, MoaRequestAuthenticator)
+    await app.state.request_authenticator.close()
 
 
 def test_postgres_switches_api_to_submission_only_and_builds_worker(tmp_path) -> None:

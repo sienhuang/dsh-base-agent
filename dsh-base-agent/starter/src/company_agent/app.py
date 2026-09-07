@@ -7,6 +7,7 @@ from pathlib import Path
 
 import uvicorn
 from dsh_base_agent import (
+    ApiAuthenticationConfig,
     ArtifactStoreConfig,
     ControlPlane,
     ControlStoreConfig,
@@ -61,14 +62,20 @@ def create_starter_app(
     runtime: RuntimeConfig | None = None,
     store_config: ControlStoreConfig | None = None,
     artifact_store_config: ArtifactStoreConfig | None = None,
+    authentication_config: ApiAuthenticationConfig | None = None,
 ) -> FastAPI:
+    root = Path(project_root or Path.cwd()).expanduser().resolve()
     return create_app(
         build_control(
-            project_root=project_root,
+            project_root=root,
             runtime=runtime,
             store_config=store_config,
             artifact_store_config=artifact_store_config,
-        )
+        ),
+        authenticator=(
+            authentication_config
+            or ApiAuthenticationConfig.from_env(env_file=root / ".env")
+        ).create(),
     )
 
 

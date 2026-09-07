@@ -16,6 +16,7 @@ from dsh_base_agent.adapters.kafka import (
     create_notification_publisher,
 )
 from dsh_base_agent.api.app import create_app
+from dsh_base_agent.api.authentication import ApiAuthenticationConfig
 from dsh_base_agent.artifacts import ArtifactStoreConfig
 from dsh_base_agent.control.plane import ControlPlane
 from dsh_base_agent.sdk.agent import Agent
@@ -54,7 +55,7 @@ def build_from_env() -> FastAPI:
                     skills=tuple(str(value) for value in item.get("skills", [])),
                 )
             )
-    return create_app(control)
+    return create_app(control, authenticator=ApiAuthenticationConfig.from_env().create())
 
 
 def main() -> None:

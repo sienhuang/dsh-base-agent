@@ -130,6 +130,29 @@ token 防止旧 Worker 提交结果。Worker Lease 在执行期间过期时，At
 fail-closed；Run 总超时和 Conversation 空闲时间可独立配置。恢复状态、Event 和 Audit 在同
 一 PostgreSQL 事务内提交。
 
+## API 身份认证
+
+本地开发默认关闭 MOA 认证，API 保留 `X-Tenant-ID/X-Principal-ID` 调用方式。生产入口可开启
+MOA Token 在线校验：
+
+```dotenv
+DSH_BASE_AGENT_AUTH_ENABLED=true
+DSH_BASE_AGENT_AUTH_TENANT_ID=moonton
+DSH_BASE_AGENT_MOA_AUTH_URL=https://login.moa.moonton.net
+DSH_BASE_AGENT_MOA_PROJECT_ID=<approved-project-id>
+DSH_BASE_AGENT_MOA_CONNECT_TIMEOUT_SECONDS=0.5
+DSH_BASE_AGENT_MOA_REQUEST_TIMEOUT_SECONDS=1
+DSH_BASE_AGENT_MOA_MAX_IN_FLIGHT=32
+```
+
+开启后，请求携带 `X-MOA-Token`。API 使用 `token + project_id` 调用 MOA
+`/api/checktoken`，只信任成功响应中的 UID、nickname 和 project，并生成
+`Principal(server_tenant, user:<lowercase-nickname>)`。客户端提交的 Tenant/Principal Header
+会被忽略。Token 不持久化也不会传给 Worker；Worker 继续使用 Run/Conversation 中已经认证的
+身份字段。
+
+认证只回答“调用者是谁”，不替代 `Authorizer`。无效身份返回 `401`，MOA 不可用返回 `503`。
+
 ## Kafka Notification
 
 可选地把 DSH SDK 的全部原始 Notification 通过有界内存队列直接发送到 Kafka：
@@ -153,7 +176,7 @@ from dsh_base_agent import create_app
 api = create_app(control)
 ```
 
-调用方必须携带 `X-Tenant-ID` 和 `X-Principal-ID`：
+关闭 MOA 认证的本地开发模式下，调用方携带 `X-Tenant-ID` 和 `X-Principal-ID`：
 
 ```bash
 curl -X POST http://127.0.0.1:8000/v1/runs \

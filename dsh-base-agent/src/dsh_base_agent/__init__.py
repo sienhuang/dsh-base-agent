@@ -11,7 +11,17 @@ from dsh_base_agent.adapters.kafka import (
     create_notification_publisher,
     publish_notifications,
 )
-from dsh_base_agent.api import create_app
+from dsh_base_agent.api import (
+    ApiAuthenticationConfig,
+    AuthenticationProviderUnavailable,
+    HeaderRequestAuthenticator,
+    MoaRequestAuthenticator,
+    RequestAuthenticationError,
+    RequestAuthenticator,
+    RequestCredentials,
+    Unauthenticated,
+    create_app,
+)
 from dsh_base_agent.artifacts import (
     ArtifactNotFoundError,
     ArtifactStore,
@@ -70,6 +80,7 @@ from dsh_base_agent.worker import WorkerConfig, WorkerService
 
 __all__ = [
     "Agent",
+    "ApiAuthenticationConfig",
     "ArtifactRecord",
     "ArtifactNotFoundError",
     "ArtifactStore",
@@ -80,6 +91,7 @@ __all__ = [
     "AuditRecord",
     "AuthorizationDenied",
     "Authorizer",
+    "AuthenticationProviderUnavailable",
     "ControlPlane",
     "ControlStore",
     "ControlStoreConfig",
@@ -90,6 +102,7 @@ __all__ = [
     "EventSource",
     "FunctionTool",
     "FunctionMemoryProvider",
+    "HeaderRequestAuthenticator",
     "KafkaNotificationConfig",
     "KafkaNotificationPublisher",
     "LeaseLostError",
@@ -99,12 +112,16 @@ __all__ = [
     "MemoryProvider",
     "MemoryReadiness",
     "MemorySearchRequest",
+    "MoaRequestAuthenticator",
     "NotificationPublisher",
     "NullNotificationPublisher",
     "Principal",
     "PostgresControlStore",
     "PublisherStats",
     "ReadOnlyByDefaultAuthorizer",
+    "RequestAuthenticationError",
+    "RequestAuthenticator",
+    "RequestCredentials",
     "RunAttempt",
     "RunEvent",
     "RunRecord",
@@ -117,6 +134,7 @@ __all__ = [
     "ToolAuthorization",
     "ToolContext",
     "ToolReadiness",
+    "Unauthenticated",
     "WorkLease",
     "WorkResourceType",
     "WorkerConfig",

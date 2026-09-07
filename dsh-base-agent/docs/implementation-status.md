@@ -22,6 +22,8 @@
 - Worker 过期恢复时 Run、Attempt、Event 和 Audit 的 PostgreSQL 原子提交；
 - LocalArtifactStore 不可变正文、逻辑 location、安全路径校验和流式读取；
 - Tool Result 超过 64 KiB 时自动写本地 Artifact，DSH 只接收有界预览和引用；
+- API 可切换开发 Header/MOA 身份认证；MOA 使用 `checktoken` 可信结果建立 Principal，Token
+  不持久化且不传给 Worker；
 - FastAPI Run 查询、事件、取消、重试、resume 占位、Artifact 查询和正文下载契约；
 - Conversation 创建、查询和追加 Run API；
 - 按 Conversation sequence 串行执行；存活 Worker 复用 Runtime 和 MCP Tool Gateway，替代

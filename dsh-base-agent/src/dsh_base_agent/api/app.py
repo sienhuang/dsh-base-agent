@@ -1,17 +1,21 @@
 """Stable company-facing HTTP contract, independent from DSH JSON-RPC."""
 
-from __future__ import annotations
-
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated, Any
 from urllib.parse import quote
 
-from fastapi import FastAPI, Header, HTTPException, Query, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.responses import StreamingResponse
 
+from dsh_base_agent.api.authentication import (
+    HeaderRequestAuthenticator,
+    RequestAuthenticationError,
+    RequestAuthenticator,
+    RequestCredentials,
+)
 from dsh_base_agent.artifacts import ArtifactNotFoundError
 from dsh_base_agent.control.auth import AuthorizationDenied, Principal
 from dsh_base_agent.control.models import (
@@ -87,21 +91,57 @@ class ConversationResponse(BaseModel):
     updated_at: datetime
 
 
-TenantHeader = Annotated[str, Header(alias="X-Tenant-ID", min_length=1)]
-PrincipalHeader = Annotated[str, Header(alias="X-Principal-ID", min_length=1)]
+OptionalTenantHeader = Annotated[str | None, Header(alias="X-Tenant-ID")]
+OptionalPrincipalHeader = Annotated[str | None, Header(alias="X-Principal-ID")]
+OptionalMoaTokenHeader = Annotated[str | None, Header(alias="X-MOA-Token")]
+OptionalAuthorizationHeader = Annotated[str | None, Header(alias="Authorization")]
 
 
-def create_app(control: ControlPlane, *, close_on_shutdown: bool = True) -> FastAPI:
+def create_app(
+    control: ControlPlane,
+    *,
+    authenticator: RequestAuthenticator | None = None,
+    close_on_shutdown: bool = True,
+) -> FastAPI:
+    selected_authenticator = authenticator or HeaderRequestAuthenticator()
+
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        await control.start()
         try:
+            await control.start()
             yield
         finally:
             if close_on_shutdown:
                 await control.close()
+            await selected_authenticator.close()
 
     app = FastAPI(title="dsh-base-agent", version="0.1.0", lifespan=lifespan)
+    app.state.request_authenticator = selected_authenticator
+
+    async def authenticated_principal(
+        tenant_id: OptionalTenantHeader = None,
+        principal_id: OptionalPrincipalHeader = None,
+        moa_token: OptionalMoaTokenHeader = None,
+        authorization: OptionalAuthorizationHeader = None,
+    ) -> Principal:
+        try:
+            return await selected_authenticator.authenticate(
+                RequestCredentials(
+                    tenant_id=tenant_id,
+                    principal_id=principal_id,
+                    moa_token=moa_token,
+                    authorization=authorization,
+                )
+            )
+        except RequestAuthenticationError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={
+                    "code": exc.code,
+                    "message": str(exc),
+                    "retryable": exc.retryable,
+                },
+            ) from exc
 
     @app.get("/health/live")
     async def live() -> dict[str, str]:
@@ -115,8 +155,7 @@ def create_app(control: ControlPlane, *, close_on_shutdown: bool = True) -> Fast
     @app.post("/v1/runs", status_code=status.HTTP_202_ACCEPTED)
     async def create_run(
         request: CreateRunRequest,
-        tenant_id: TenantHeader,
-        principal_id: PrincipalHeader,
+        principal: Annotated[Principal, Depends(authenticated_principal)],
         idempotency_key: Annotated[
             str | None,
             Header(alias="Idempotency-Key", min_length=1, max_length=256),
@@ -124,7 +163,7 @@ def create_app(control: ControlPlane, *, close_on_shutdown: bool = True) -> Fast
     ) -> RunRecord:
         try:
             return await control.submit(
-                principal=Principal(tenant_id, principal_id),
+                principal=principal,
                 agent_id=request.agent_id,
                 input=request.input,
                 idempotency_key=idempotency_key,
@@ -132,7 +171,9 @@ def create_app(control: ControlPlane, *, close_on_shutdown: bool = True) -> Fast
             )
         except AgentNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except (AuthorizationDenied, IdempotencyConflictError) as exc:
+        except AuthorizationDenied as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except IdempotencyConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post(
@@ -141,12 +182,11 @@ def create_app(control: ControlPlane, *, close_on_shutdown: bool = True) -> Fast
     )
     async def create_conversation(
         request: CreateConversationRequest,
-        tenant_id: TenantHeader,
-        principal_id: PrincipalHeader,
+        principal: Annotated[Principal, Depends(authenticated_principal)],
     ) -> ConversationResponse:
         try:
             conversation = await control.create_conversation(
-                principal=Principal(tenant_id, principal_id),
+                principal=principal,
                 agent_id=request.agent_id,
                 metadata=request.metadata,
             )
@@ -154,18 +194,17 @@ def create_app(control: ControlPlane, *, close_on_shutdown: bool = True) -> Fast
         except AgentNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except AuthorizationDenied as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
 
     @app.get("/v1/conversations/{conversation_id}")
     async def get_conversation(
         conversation_id: str,
-        tenant_id: TenantHeader,
-        principal_id: PrincipalHeader,
+        principal: Annotated[Principal, Depends(authenticated_principal)],
     ) -> ConversationResponse:
         try:
             return ConversationResponse.model_validate(
                 await control.get_conversation(
-                    Principal(tenant_id, principal_id),
+                    principal,
                     conversation_id,
                 )
             )
@@ -181,8 +220,7 @@ def create_app(control: ControlPlane, *, close_on_shutdown: bool = True) -> Fast
     async def create_conversation_run(
         conversation_id: str,
         request: CreateConversationRunRequest,
-        tenant_id: TenantHeader,
-        principal_id: PrincipalHeader,
+        principal: Annotated[Principal, Depends(authenticated_principal)],
         idempotency_key: Annotated[
             str | None,
             Header(alias="Idempotency-Key", min_length=1, max_length=256),
@@ -190,7 +228,7 @@ def create_app(control: ControlPlane, *, close_on_shutdown: bool = True) -> Fast
     ) -> RunRecord:
         try:
             return await control.submit_to_conversation(
-                principal=Principal(tenant_id, principal_id),
+                principal=principal,
                 conversation_id=conversation_id,
                 input=request.input,
                 idempotency_key=idempotency_key,
@@ -200,18 +238,19 @@ def create_app(control: ControlPlane, *, close_on_shutdown: bool = True) -> Fast
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ConversationAccessDenied as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
-        except (AuthorizationDenied, RunTransitionError) as exc:
+        except AuthorizationDenied as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except RunTransitionError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/v1/conversations/{conversation_id}/runs")
     async def list_conversation_runs(
         conversation_id: str,
-        tenant_id: TenantHeader,
-        principal_id: PrincipalHeader,
+        principal: Annotated[Principal, Depends(authenticated_principal)],
     ) -> tuple[RunRecord, ...]:
         try:
             return await control.conversation_runs(
-                Principal(tenant_id, principal_id),
+                principal,
                 conversation_id,
             )
         except ConversationNotFoundError as exc:
@@ -222,22 +261,20 @@ def create_app(control: ControlPlane, *, close_on_shutdown: bool = True) -> Fast
     @app.get("/v1/runs/{run_id}")
     async def get_run(
         run_id: str,
-        tenant_id: TenantHeader,
-        principal_id: PrincipalHeader,
+        principal: Annotated[Principal, Depends(authenticated_principal)],
     ) -> RunResponse:
-        view = await _view(control, Principal(tenant_id, principal_id), run_id)
+        view = await _view(control, principal, run_id)
         return RunResponse(run=view.run, attempts=view.attempts)
 
     @app.get("/v1/runs/{run_id}/events")
     async def get_events(
         run_id: str,
-        tenant_id: TenantHeader,
-        principal_id: PrincipalHeader,
+        principal: Annotated[Principal, Depends(authenticated_principal)],
         after: Annotated[int, Query(ge=0)] = 0,
     ) -> tuple[RunEvent, ...]:
         try:
             return await control.events(
-                Principal(tenant_id, principal_id),
+                principal,
                 run_id,
                 after=after,
             )
@@ -249,29 +286,26 @@ def create_app(control: ControlPlane, *, close_on_shutdown: bool = True) -> Fast
     @app.post("/v1/runs/{run_id}/cancel")
     async def cancel_run(
         run_id: str,
-        tenant_id: TenantHeader,
-        principal_id: PrincipalHeader,
+        principal: Annotated[Principal, Depends(authenticated_principal)],
     ) -> RunRecord:
-        return await _transition(control.cancel, Principal(tenant_id, principal_id), run_id)
+        return await _transition(control.cancel, principal, run_id)
 
     @app.post("/v1/runs/{run_id}/retry", status_code=status.HTTP_202_ACCEPTED)
     async def retry_run(
         run_id: str,
-        tenant_id: TenantHeader,
-        principal_id: PrincipalHeader,
+        principal: Annotated[Principal, Depends(authenticated_principal)],
     ) -> RunRecord:
-        return await _transition(control.retry, Principal(tenant_id, principal_id), run_id)
+        return await _transition(control.retry, principal, run_id)
 
     @app.post("/v1/runs/{run_id}/resume")
     async def resume_run(
         run_id: str,
         request: ResumeRunRequest,
-        tenant_id: TenantHeader,
-        principal_id: PrincipalHeader,
+        principal: Annotated[Principal, Depends(authenticated_principal)],
     ) -> RunRecord:
         try:
             return await control.resume(
-                Principal(tenant_id, principal_id),
+                principal,
                 run_id,
                 input=request.input,
             )
@@ -287,11 +321,10 @@ def create_app(control: ControlPlane, *, close_on_shutdown: bool = True) -> Fast
     @app.get("/v1/runs/{run_id}/artifacts")
     async def get_artifacts(
         run_id: str,
-        tenant_id: TenantHeader,
-        principal_id: PrincipalHeader,
+        principal: Annotated[Principal, Depends(authenticated_principal)],
     ) -> tuple[ArtifactRecord, ...]:
         try:
-            return await control.artifacts(Principal(tenant_id, principal_id), run_id)
+            return await control.artifacts(principal, run_id)
         except RunNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except RunAccessDenied as exc:
@@ -301,12 +334,11 @@ def create_app(control: ControlPlane, *, close_on_shutdown: bool = True) -> Fast
     async def get_artifact_content(
         run_id: str,
         artifact_id: str,
-        tenant_id: TenantHeader,
-        principal_id: PrincipalHeader,
+        principal: Annotated[Principal, Depends(authenticated_principal)],
     ) -> StreamingResponse:
         try:
             record, content = await control.open_artifact(
-                Principal(tenant_id, principal_id),
+                principal,
                 run_id,
                 artifact_id,
             )

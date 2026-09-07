@@ -13,6 +13,30 @@ uv sync --all-groups
 uv run company-agent-server
 ```
 
+默认关闭 MOA 认证，方便没有前端和 `X-MOA-Token` 的本地开发。此时调用方式保持不变，仍需传入
+`X-Tenant-ID` 和 `X-Principal-ID`。开启 MOA 认证时配置：
+
+```dotenv
+DSH_BASE_AGENT_AUTH_ENABLED=true
+DSH_BASE_AGENT_AUTH_TENANT_ID=demo-tenant
+DSH_BASE_AGENT_MOA_AUTH_URL=https://login.moa.moonton.net
+DSH_BASE_AGENT_MOA_PROJECT_ID=<为本应用审批的 MOA project id>
+```
+
+开启后，业务 API 只使用 `X-MOA-Token` 建立可信 `Principal`；请求中的
+`X-Tenant-ID/X-Principal-ID` 不参与身份判定。API 不保存原始 Token，Worker 仍然只从 Run 或
+Conversation 读取已认证的 `tenant_id/principal_id`，不需要 MOA 配置。
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/runs \
+  -H 'Content-Type: application/json' \
+  -H "X-MOA-Token: ${MOA_TOKEN}" \
+  -d '{"agent_id":"iris-assistant-1","input":"查询 order-001"}'
+```
+
+无 Token、无效 Token或 MOA project 不匹配返回 `401`；MOA 超时、限流、5xx 或畸形响应返回
+`503`。原始 Token 不写入 PostgreSQL、Audit、Kafka、日志或模型上下文。
+
 默认使用 `workspace/.dsh-base-agent/control.db`。需要 PostgreSQL 时，在 `.env` 中增加：
 
 ```dotenv
