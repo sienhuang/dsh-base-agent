@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import asyncio
 
-from dsh_base_agent import Agent, ControlPlane, Principal, RuntimeConfig, tool
+from dsh_base_agent import (
+    Agent,
+    ControlPlane,
+    ControlStoreConfig,
+    Principal,
+    RuntimeConfig,
+    tool,
+)
 
 
 @tool(side_effect=False)
@@ -15,7 +22,11 @@ def query_order(order_id: str) -> dict[str, str]:
 
 
 async def main() -> None:
-    control = ControlPlane(workspace=".", runtime=RuntimeConfig.from_env())
+    control = ControlPlane(
+        workspace=".",
+        runtime=RuntimeConfig.from_env(),
+        store_config=ControlStoreConfig.from_env(),
+    )
     control.register(
         Agent(
             name="order-assistant",
@@ -38,4 +49,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-

@@ -1,4 +1,4 @@
-"""Durable SQLite control-plane store with CAS and append-only logs."""
+"""Control-store protocol, shared errors, and the local SQLite implementation."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from collections.abc import Collection
 from pathlib import Path
 from typing import Any, Protocol
 
-from dsh_base_agent.models import (
+from dsh_base_agent.control.models import (
     ArtifactRecord,
     AuditRecord,
     ConversationRecord,
@@ -19,6 +19,7 @@ from dsh_base_agent.models import (
     RunAttempt,
     RunEvent,
     RunRecord,
+    WorkLease,
 )
 
 
@@ -43,6 +44,10 @@ class RevisionConflictError(StoreError):
 
 
 class IdempotencyConflictError(StoreError):
+    pass
+
+
+class LeaseLostError(StoreError):
     pass
 
 
@@ -97,6 +102,7 @@ class ControlStore(Protocol):
         attempt: RunAttempt,
         *,
         expected_run_revision: int,
+        lease: WorkLease | None = None,
     ) -> None: ...
 
     async def get_attempt(self, attempt_id: str) -> RunAttempt: ...
@@ -106,6 +112,7 @@ class ControlStore(Protocol):
         attempt: RunAttempt,
         *,
         expected_revision: int,
+        lease: WorkLease | None = None,
     ) -> None: ...
 
     async def settle_attempt(
@@ -115,6 +122,7 @@ class ControlStore(Protocol):
         *,
         expected_run_revision: int,
         expected_attempt_revision: int,
+        lease: WorkLease | None = None,
     ) -> None: ...
 
     async def list_attempts(self, run_id: str) -> tuple[RunAttempt, ...]: ...
@@ -139,12 +147,29 @@ class ControlStore(Protocol):
 
     async def list_artifacts(self, run_id: str) -> tuple[ArtifactRecord, ...]: ...
 
+    async def claim_work(self, *, worker_id: str, lease_seconds: float) -> WorkLease | None: ...
+
+    async def renew_work_lease(
+        self,
+        lease: WorkLease,
+        *,
+        lease_seconds: float,
+    ) -> WorkLease | None: ...
+
+    async def release_work_lease(self, lease: WorkLease) -> bool: ...
+
+    async def interrupt_expired_attempts(
+        self,
+        *,
+        limit: int = 100,
+    ) -> tuple[tuple[RunRecord, RunAttempt], ...]: ...
+
 
 class SqliteControlStore:
     """Small durable store suitable for one control-plane process.
 
-    Production multi-replica deployments can implement ``ControlStore`` with
-    PostgreSQL without changing the public SDK or HTTP contract.
+    Production multi-replica deployments use ``PostgresControlStore`` without
+    changing the public SDK or HTTP contract.
     """
 
     def __init__(self, path: str | Path) -> None:
@@ -363,10 +388,7 @@ class SqliteControlStore:
             connection = self._require_connection()
             self._get_conversation_sync(connection, conversation_id)
             rows = connection.execute("SELECT payload FROM runs ORDER BY rowid").fetchall()
-            runs = (
-                RunRecord.model_validate_json(row["payload"])
-                for row in rows
-            )
+            runs = (RunRecord.model_validate_json(row["payload"]) for row in rows)
             return tuple(
                 sorted(
                     (run for run in runs if run.conversation_id == conversation_id),
@@ -478,7 +500,10 @@ class SqliteControlStore:
         attempt: RunAttempt,
         *,
         expected_run_revision: int,
+        lease: WorkLease | None = None,
     ) -> None:
+        if lease is not None:
+            raise StoreError("distributed Worker fencing requires PostgreSQL")
         if run.revision != expected_run_revision + 1:
             raise ValueError("replacement Run revision must increment by one")
         async with self._lock:
@@ -523,10 +548,14 @@ class SqliteControlStore:
 
     async def get_attempt(self, attempt_id: str) -> RunAttempt:
         async with self._lock:
-            row = self._require_connection().execute(
-                "SELECT payload FROM run_attempts WHERE attempt_id = ?",
-                (attempt_id,),
-            ).fetchone()
+            row = (
+                self._require_connection()
+                .execute(
+                    "SELECT payload FROM run_attempts WHERE attempt_id = ?",
+                    (attempt_id,),
+                )
+                .fetchone()
+            )
             if row is None:
                 raise AttemptNotFoundError(f"RunAttempt '{attempt_id}' was not found")
             return RunAttempt.model_validate_json(row["payload"])
@@ -536,7 +565,10 @@ class SqliteControlStore:
         attempt: RunAttempt,
         *,
         expected_revision: int,
+        lease: WorkLease | None = None,
     ) -> None:
+        if lease is not None:
+            raise StoreError("distributed Worker fencing requires PostgreSQL")
         if attempt.revision != expected_revision + 1:
             raise ValueError("replacement RunAttempt revision must increment by one")
         async with self._lock:
@@ -568,7 +600,10 @@ class SqliteControlStore:
         *,
         expected_run_revision: int,
         expected_attempt_revision: int,
+        lease: WorkLease | None = None,
     ) -> None:
+        if lease is not None:
+            raise StoreError("distributed Worker fencing requires PostgreSQL")
         if run.revision != expected_run_revision + 1:
             raise ValueError("replacement Run revision must increment by one")
         if attempt.revision != expected_attempt_revision + 1:
@@ -616,10 +651,14 @@ class SqliteControlStore:
 
     async def list_attempts(self, run_id: str) -> tuple[RunAttempt, ...]:
         async with self._lock:
-            rows = self._require_connection().execute(
-                "SELECT payload FROM run_attempts WHERE run_id = ? ORDER BY number",
-                (run_id,),
-            ).fetchall()
+            rows = (
+                self._require_connection()
+                .execute(
+                    "SELECT payload FROM run_attempts WHERE run_id = ? ORDER BY number",
+                    (run_id,),
+                )
+                .fetchall()
+            )
             return tuple(RunAttempt.model_validate_json(row["payload"]) for row in rows)
 
     async def append_event(
@@ -675,13 +714,17 @@ class SqliteControlStore:
 
     async def list_events(self, run_id: str, *, after: int = 0) -> tuple[RunEvent, ...]:
         async with self._lock:
-            rows = self._require_connection().execute(
-                """
+            rows = (
+                self._require_connection()
+                .execute(
+                    """
                 SELECT payload FROM run_events
                 WHERE run_id = ? AND sequence > ? ORDER BY sequence
                 """,
-                (run_id, after),
-            ).fetchall()
+                    (run_id, after),
+                )
+                .fetchall()
+            )
             return tuple(RunEvent.model_validate_json(row["payload"]) for row in rows)
 
     async def append_audit(self, record: AuditRecord) -> None:
@@ -707,10 +750,14 @@ class SqliteControlStore:
 
     async def list_audit(self, run_id: str) -> tuple[AuditRecord, ...]:
         async with self._lock:
-            rows = self._require_connection().execute(
-                "SELECT payload FROM audit_log WHERE run_id = ? ORDER BY rowid",
-                (run_id,),
-            ).fetchall()
+            rows = (
+                self._require_connection()
+                .execute(
+                    "SELECT payload FROM audit_log WHERE run_id = ? ORDER BY rowid",
+                    (run_id,),
+                )
+                .fetchall()
+            )
             return tuple(AuditRecord.model_validate_json(row["payload"]) for row in rows)
 
     async def add_artifact(self, artifact: ArtifactRecord) -> None:
@@ -732,11 +779,40 @@ class SqliteControlStore:
 
     async def list_artifacts(self, run_id: str) -> tuple[ArtifactRecord, ...]:
         async with self._lock:
-            rows = self._require_connection().execute(
-                "SELECT payload FROM artifacts WHERE run_id = ? ORDER BY rowid",
-                (run_id,),
-            ).fetchall()
+            rows = (
+                self._require_connection()
+                .execute(
+                    "SELECT payload FROM artifacts WHERE run_id = ? ORDER BY rowid",
+                    (run_id,),
+                )
+                .fetchall()
+            )
             return tuple(ArtifactRecord.model_validate_json(row["payload"]) for row in rows)
+
+    async def claim_work(self, *, worker_id: str, lease_seconds: float) -> WorkLease | None:
+        del worker_id, lease_seconds
+        raise StoreError("distributed Worker leases require PostgreSQL")
+
+    async def renew_work_lease(
+        self,
+        lease: WorkLease,
+        *,
+        lease_seconds: float,
+    ) -> WorkLease | None:
+        del lease, lease_seconds
+        raise StoreError("distributed Worker leases require PostgreSQL")
+
+    async def release_work_lease(self, lease: WorkLease) -> bool:
+        del lease
+        raise StoreError("distributed Worker leases require PostgreSQL")
+
+    async def interrupt_expired_attempts(
+        self,
+        *,
+        limit: int = 100,
+    ) -> tuple[tuple[RunRecord, RunAttempt], ...]:
+        del limit
+        raise StoreError("distributed Worker recovery requires PostgreSQL")
 
     def _require_connection(self) -> sqlite3.Connection:
         if self._connection is None:
@@ -763,9 +839,7 @@ class SqliteControlStore:
             (conversation_id,),
         ).fetchone()
         if row is None:
-            raise ConversationNotFoundError(
-                f"Conversation '{conversation_id}' was not found"
-            )
+            raise ConversationNotFoundError(f"Conversation '{conversation_id}' was not found")
         return ConversationRecord.model_validate_json(row["payload"])
 
 
@@ -895,6 +969,7 @@ __all__ = [
     "ConversationNotFoundError",
     "ControlStore",
     "IdempotencyConflictError",
+    "LeaseLostError",
     "RevisionConflictError",
     "RunNotFoundError",
     "SqliteControlStore",

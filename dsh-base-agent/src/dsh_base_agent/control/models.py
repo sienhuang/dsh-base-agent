@@ -37,6 +37,19 @@ class AttemptStatus(StrEnum):
     INTERRUPTED = "interrupted"
 
 
+class DispatchState(StrEnum):
+    NOT_SENT = "not_sent"
+    DISPATCHING = "dispatching"
+    ACCEPTED = "accepted"
+    SETTLED = "settled"
+    UNKNOWN = "unknown"
+
+
+class WorkResourceType(StrEnum):
+    RUN = "run"
+    CONVERSATION = "conversation"
+
+
 class ConversationStatus(StrEnum):
     ACTIVE = "active"
     BLOCKED = "blocked"
@@ -107,6 +120,9 @@ class RunAttempt(BaseModel):
     number: int = Field(ge=1)
     dsh_session_id: str = Field(min_length=1)
     status: AttemptStatus = AttemptStatus.QUEUED
+    dispatch_state: DispatchState = DispatchState.NOT_SENT
+    worker_id: str | None = None
+    lease_token: int | None = Field(default=None, ge=1)
     revision: int = Field(default=1, ge=1)
     finish_reason: str | None = None
     output: str | None = None
@@ -166,6 +182,16 @@ class ArtifactRecord(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
-TERMINAL_RUN_STATUSES = frozenset(
-    {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED}
-)
+class WorkLease(BaseModel):
+    """A PostgreSQL-owned fencing lease for one executable resource."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    resource_type: WorkResourceType
+    resource_id: str = Field(min_length=1)
+    worker_id: str = Field(min_length=1)
+    lease_token: int = Field(ge=1)
+    expires_at: datetime
+
+
+TERMINAL_RUN_STATUSES = frozenset({RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED})

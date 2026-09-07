@@ -26,10 +26,11 @@ companion bridge，并保留官方 `initialize`、`session/prompt` 和 `shutdown
 
 ## 2. 必须区分的三种语义
 
-### 2.1 Session 多轮继续
+### 2.1 Session 多轮继续和 Worker 换手
 
-同一个存活的 Harness 和 Session ID 再次接收 `session/prompt`，会创建下一个 Turn。这是多轮
-对话，不是暂停恢复。
+同一个 Session ID 再次接收 `session/prompt`，会创建下一个 Turn。Harness 重建时，替代
+Worker 使用共享持久化 DSH Home 和原 Session ID 继续下一轮。这是 Conversation 换手，不是
+恢复被中断的原 Turn。
 
 ### 2.2 Session 生命周期恢复
 
@@ -118,7 +119,7 @@ lease 或 fencing token 的 Worker 不得提交结果。
 ## 6. 分阶段实施
 
 1. 实现插件骨架、`dba/capabilities` 和协议兼容测试；
-2. 实现空闲持久化 Session 的 `dba/session/resume`，验证进程重建后的多轮上下文；
+2. 实现 `dba/session/resume`，用于中断 Turn 的状态对账和显式处置；
 3. 实现 Session status、event 和 cancel 的规范化适配；
 4. 实现 live approval 请求、ControlPlane `WAITING` 投影和幂等回答；
 5. 做进程退出、网络断开、重复回答、lease 过期和多 Worker 竞争测试；
@@ -127,7 +128,7 @@ lease 或 fencing token 的 Worker 不得提交结果。
 ## 7. 第一阶段验收边界
 
 - Python 客户端能通过 capability handshake 发现扩展；
-- 已持久化的空闲 Session 可在 Runtime 重建后恢复，并用新 Turn 延续上下文；
+- 可查询中断 Session/Turn 的状态，并区分继续监听、失败闭合和不可恢复；
 - live approval 可以进入业务 `WAITING`，回答后原 Turn 继续；
 - Runtime 在审批等待期间退出时失败闭合，不重放未知 Tool；
 - Session、Run、审批和 Tenant/Principal 的映射经过权限校验并写入审计；

@@ -282,9 +282,9 @@ ConversationRuntimeManager
 - `runtime.close()` 只释放进程资源，不代表关闭业务 Conversation；
 - `Conversation.close` 才是业务终止语义。
 
-在启用跨进程 Worker 前，必须用真实 DSH 做验收测试，确认相同 DSH Home 的持久化 Session
-可在 Harness 重建后继续。若 DSH Session 只能依赖本地 Home，则调度器必须提供 sticky
-placement/共享卷；不能仅在 PostgreSQL 保存一个 Session ID 就认为任意 Worker 都能恢复。
+跨进程 Worker 使用共享持久卷保存 DSH Home。替代 Worker 根据 PostgreSQL 中的
+`dsh_home_key + dsh_session_id` 重建 Harness 并提交下一个 Turn；只保存 Session ID 而没有共
+享其 DSH Home 不构成上下文延续。
 
 ## 7. Event 与外部存储
 
@@ -345,16 +345,19 @@ NOT_SENT
 └── 可以安全重新入队，没有向 DSH 增加 Turn
 
 DISPATCHING / UNKNOWN
-└── 不知道 Prompt 是否进入 Session，Conversation → BLOCKED
+└── 不知道 Prompt 是否进入 Session，不重放原 Run
 
 ACCEPTED
-└── Prompt 已进入 Session；结果不确定时 Conversation → BLOCKED
+└── Prompt 已进入 Session；结果不确定时不重放原 Run
 
 SETTLED
 └── 根据最终结果推进队列
 ```
 
-不能因为 Worker 重启就重新发送原始 Prompt，否则会产生重复 Turn 和重复副作用。
+不能因为 Worker 重启就重新发送原始 Prompt，否则会产生重复 Turn 和重复副作用。Worker
+lease 过期时，未知边界的 Run 失败闭合，但 Conversation 保持 `ACTIVE`，替代 Worker 可以用
+原 Session 接收新的 Run。显式取消和 Runtime 自身故障仍可按策略将 Conversation 标为
+`BLOCKED`。
 
 ### 9.2 取消
 
@@ -385,18 +388,17 @@ RUNNING + NOT_SENT
 RUNNING + ACCEPTED/DISPATCHING/UNKNOWN
 └── Attempt → INTERRUPTED
     Run → FAILED
-    Conversation → BLOCKED
-    等待 DSH 对账或人工处理
+    Conversation 保持 ACTIVE
+    不重放原 Run；允许替代 Worker 接收下一个 Turn
 
 WAITING
 └── 保持阻塞；只能通过经过 capability 验证的 DSH 扩展恢复
 ```
 
-后续采用公司自有 DSH 插件和 JSON-RPC 扩展，把 DSH 核心的 Session resume、status 和
-approval answerer 适配给 Python 控制面，详见
-[`dsh-resume-extension.md`](dsh-resume-extension.md)。`ctx.agents.resume()` 只表示重新加载持久化
-Session，不代表恢复中断的 Tool 调用栈。适配层恢复前必须与 DSH 对账，再决定发送新 Turn、
-继续监听或保持阻塞。ControlPlane 不读取和推断 DSH 内部 JSONL 文件来伪造状态。
+后续采用公司自有 DSH 插件和 JSON-RPC 扩展，把 DSH Session status、原 Turn 对账和 approval
+answerer 适配给 Python 控制面，详见 [`dsh-resume-extension.md`](dsh-resume-extension.md)。这
+用于恢复或处置被中断的原 Turn，不是替代 Worker 接收下一个 Turn 的前置条件。ControlPlane
+不读取和推断 DSH 内部 JSONL 文件来伪造状态。
 
 ## 11. Store 与部署
 

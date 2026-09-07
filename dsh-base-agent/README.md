@@ -10,11 +10,15 @@
 - 业务 Run、RunAttempt、DSH Session 映射；
 - 稳定的 FastAPI Run API；
 - 追加式运行事件和独立审计记录；
+- Tool 大结果的本地 ArtifactStore 和流式下载；
 - 官方 `deepseek-harness-sdk` 的窄适配层。
 
 当前代码的逐项完成度见 [`docs/implementation-status.md`](docs/implementation-status.md)。
 业务开发可从 [`starter/`](starter/README.md) 复制一个最小应用，再添加自己的 Tool、Skill、
 静态 Context 和授权策略。
+
+源码已按 SDK、Control Plane、Adapter、API 和 Store 边界组织，目录说明和依赖规则见
+[`docs/code-layout.md`](docs/code-layout.md)。
 
 ```python
 from dsh_base_agent import Agent, ControlPlane, RuntimeConfig, tool
@@ -68,6 +72,58 @@ RuntimeConfig.from_env(env_file=None)
 `.dsh-base-agent/control.db`，把每个不可变 Agent 定义的 DSH 数据隔离在独立目录。一次业务
 Run 可以拥有多个 RunAttempt，每个 Attempt 对应一个独立的 DSH Session。
 
+生产环境可通过独立的控制面配置切换到 PostgreSQL；它不属于只负责 DSH 的
+`RuntimeConfig`：
+
+```dotenv
+DSH_BASE_AGENT_DATABASE_URL=postgresql://agent:secret@postgres:5432/dsh_base_agent
+DSH_BASE_AGENT_DATABASE_SCHEMA=dsh_base_agent
+DSH_BASE_AGENT_DATABASE_POOL_MIN_SIZE=1
+DSH_BASE_AGENT_DATABASE_POOL_MAX_SIZE=10
+```
+
+```python
+from dsh_base_agent import ControlStoreConfig
+
+control = ControlPlane(
+    workspace=".",
+    runtime=RuntimeConfig.from_env(),
+    store_config=ControlStoreConfig.from_env(),
+)
+```
+
+`dsh-base-agent-server` 和 starter 启动器已经自动读取这些变量。未设置
+`DSH_BASE_AGENT_DATABASE_URL` 时使用 SQLite 进程内执行；设置后 API 只提交 `QUEUED` Run，
+独立 Worker 使用异步 PostgreSQL 连接池领取并执行。启动时会串行执行带 checksum 的版本化
+迁移。详细说明见
+[`docs/postgresql.md`](docs/postgresql.md)。
+
+PostgreSQL 模式需要分别启动 API 和 Worker：
+
+```bash
+dsh-base-agent-server
+dsh-base-agent-worker
+```
+
+Worker 通过 `FOR UPDATE SKIP LOCKED` 领取工作，使用 Lease、Heartbeat 和单调递增的 fencing
+token 防止旧 Worker 提交结果。Worker Lease 在执行期间过期时，Attempt 会保守转为
+`INTERRUPTED/UNKNOWN`，不会自动重放状态不确定的 DSH Prompt。Heartbeat 异常会
+fail-closed；Run 总超时和 Conversation 空闲时间可独立配置。恢复状态、Event 和 Audit 在同
+一 PostgreSQL 事务内提交。
+
+## Kafka Notification
+
+可选地把 DSH SDK 的全部原始 Notification 通过有界内存队列直接发送到 Kafka：
+
+```dotenv
+DSH_BASE_AGENT_KAFKA_BOOTSTRAP_SERVERS=kafka-1:9092,kafka-2:9092
+DSH_BASE_AGENT_KAFKA_TOPIC=dsh.notifications.v1
+```
+
+这条链路不使用 Outbox，Kafka 是允许少量丢失的实时观测流，不取代 PostgreSQL Run/Audit 或
+DSH Session/Event 的真相源地位。详细配置和交付语义见
+[`docs/kafka-notifications.md`](docs/kafka-notifications.md)。
+
 ## HTTP API
 
 应用代码注册 Agent 后，使用 `create_app(control)` 创建 FastAPI：
@@ -99,12 +155,18 @@ POST   /v1/runs/{run_id}/cancel
 POST   /v1/runs/{run_id}/retry
 POST   /v1/runs/{run_id}/resume
 GET    /v1/runs/{run_id}/artifacts
+GET    /v1/runs/{run_id}/artifacts/{artifact_id}/content
 
 POST   /v1/conversations
 GET    /v1/conversations/{conversation_id}
 POST   /v1/conversations/{conversation_id}/runs
 GET    /v1/conversations/{conversation_id}/runs
 ```
+
+Tool 返回 JSON 超过 64 KiB 时，完整正文默认写入
+`<workspace>/.dsh-base-agent/artifacts`，SQLite/PostgreSQL 只保存 ArtifactRecord，DSH 只接收
+有界预览和引用。API/Worker 分离部署必须让二者共享该目录。配置和安全边界见
+[`docs/artifacts.md`](docs/artifacts.md)。
 
 `POST /v1/runs` 保持单次独立 Session 语义。需要多轮上下文时，先创建 Conversation，再向
 Conversation 连续提交 Run。同一 Conversation 固定绑定 Tenant、Principal、Agent 版本、DSH
@@ -190,13 +252,16 @@ Agent.skills
 - 当前 DSH SDK pin 没有 Host session-resume/cancel 方法；`resume` 会明确返回不支持，取消
   通过关闭本次 DSH Runtime 完成。后续采用 DSH 插件和版本化 JSON-RPC 扩展，设计见
   [`docs/dsh-resume-extension.md`](docs/dsh-resume-extension.md)。
-- Conversation 已支持当前进程内的多 Run 串行和 Session 复用；已打开的 Conversation 在
-  ControlPlane 重启后会失败闭合为 `BLOCKED`，不会用新 Runtime 冒充恢复原 Session。
+- Conversation 支持跨 Worker 串行复用持久化 Session；替代 Worker 使用相同的
+  `DSH_HOME + dsh_session_id` 处理新的 Turn，但不会恢复或自动重放被中断的原 Run。
 - `skills` 已进入 Agent fingerprint，并控制是否开放 DSH 原生 Skill Tool；Skill 包的安装、
   allowlist 和版本锁定尚未自动化。
 - Artifact 数据模型和查询 API 已建立，DSH Attachment 到业务 Artifact 的自动收集尚未接入。
 - 服务重启时，原本 `RUNNING` 的 Attempt 会标记为 `INTERRUPTED`，业务 Run 标记为
   `FAILED`，不会盲目重放原 prompt；调用方可显式 retry 创建新 Attempt 和 Session。
+
+逐步生产化的 P0/P1/P2 实施顺序和验收门槛见
+[`docs/production-roadmap.md`](docs/production-roadmap.md)。
 
 ## 验证
 

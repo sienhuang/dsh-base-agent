@@ -6,12 +6,22 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated, Any
+from urllib.parse import quote
 
 from fastapi import FastAPI, Header, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.responses import StreamingResponse
 
-from dsh_base_agent.auth import AuthorizationDenied, Principal
-from dsh_base_agent.control import (
+from dsh_base_agent.artifacts import ArtifactNotFoundError
+from dsh_base_agent.control.auth import AuthorizationDenied, Principal
+from dsh_base_agent.control.models import (
+    ArtifactRecord,
+    ConversationStatus,
+    RunAttempt,
+    RunEvent,
+    RunRecord,
+)
+from dsh_base_agent.control.plane import (
     AgentNotFoundError,
     ControlPlane,
     ConversationAccessDenied,
@@ -19,13 +29,6 @@ from dsh_base_agent.control import (
     RunResumeUnsupported,
     RunTransitionError,
     RunView,
-)
-from dsh_base_agent.models import (
-    ArtifactRecord,
-    ConversationStatus,
-    RunAttempt,
-    RunEvent,
-    RunRecord,
 )
 from dsh_base_agent.store import (
     ConversationNotFoundError,
@@ -293,6 +296,35 @@ def create_app(control: ControlPlane, *, close_on_shutdown: bool = True) -> Fast
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except RunAccessDenied as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    @app.get("/v1/runs/{run_id}/artifacts/{artifact_id}/content")
+    async def get_artifact_content(
+        run_id: str,
+        artifact_id: str,
+        tenant_id: TenantHeader,
+        principal_id: PrincipalHeader,
+    ) -> StreamingResponse:
+        try:
+            record, content = await control.open_artifact(
+                Principal(tenant_id, principal_id),
+                run_id,
+                artifact_id,
+            )
+        except (RunNotFoundError, ArtifactNotFoundError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RunAccessDenied as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        return StreamingResponse(
+            content,
+            media_type=record.media_type,
+            headers={
+                "Content-Length": str(record.size_bytes),
+                "Content-Disposition": (
+                    "attachment; filename*=UTF-8''" + quote(record.name, safe="")
+                ),
+                "X-Artifact-SHA256": record.sha256,
+            },
+        )
 
     return app
 

@@ -54,4 +54,3 @@ def test_tool_rejects_untyped_parameters() -> None:
         @tool
         def invalid(value):  # type: ignore[no-untyped-def]
             return value
-

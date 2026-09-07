@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,11 +12,12 @@ from typing import Any, Protocol, runtime_checkable
 
 from dotenv import dotenv_values
 
-from dsh_base_agent.agent import Agent
-from dsh_base_agent.profile import DshProfileCompiler
+from dsh_base_agent.adapters.dsh.profile import DshProfileCompiler
+from dsh_base_agent.sdk.agent import Agent
 
 type JsonObject = dict[str, Any]
 type DshEventHandler = Callable[[JsonObject], Awaitable[None]]
+type DshNotificationHandler = Callable[[str, JsonObject], Awaitable[None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +96,7 @@ class DshRuntime(Protocol):
         *,
         session_id: str,
         on_event: DshEventHandler | None = None,
+        on_notification: DshNotificationHandler | None = None,
     ) -> DshRunResult: ...
 
     async def close(self) -> None: ...
@@ -139,6 +141,7 @@ class OfficialDshRuntimeFactory:
         resolved_home.mkdir(parents=True, exist_ok=True)
         patches = self.compiler.compile(
             agent,
+            workspace=workspace,
             dsh_home=resolved_home,
             attempt_id=attempt_id,
             tool_gateway_url=tool_gateway_url,
@@ -146,7 +149,7 @@ class OfficialDshRuntimeFactory:
         harness = DeepSeekHarness(
             dsh_home=str(resolved_home),
             cwd=str(workspace.expanduser().resolve()),
-            profile="sdk", 
+            profile="sdk",
             patches=tuple(str(path.resolve()) for path in patches),
             provider=self.config.provider,
             model=self.config.model,
@@ -166,6 +169,7 @@ class _OfficialDshRuntime:
     def __init__(self, harness: Any) -> None:
         self._harness = harness
         self._closed = False
+        self._close_lock = asyncio.Lock()
 
     async def run(
         self,
@@ -173,21 +177,33 @@ class _OfficialDshRuntime:
         *,
         session_id: str,
         on_event: DshEventHandler | None = None,
+        on_notification: DshNotificationHandler | None = None,
     ) -> DshRunResult:
         if self._closed:
             raise RuntimeError("DSH Runtime is closed")
         loop = asyncio.get_running_loop()
-        pending: asyncio.Queue[JsonObject] = asyncio.Queue()
+        pending: asyncio.Queue[tuple[str, JsonObject]] = asyncio.Queue()
 
         def receive(notification: Any) -> None:
-            if notification.method != "session.event":
+            method = getattr(notification, "method", None)
+            if not isinstance(method, str):
                 return
-            payload = notification.payload
-            if payload.get("sessionId") != session_id:
+            raw_payload = getattr(notification, "payload", None)
+            if not isinstance(raw_payload, Mapping):
+                return
+            payload = dict(raw_payload)
+            if on_notification is None and method != "session.event":
+                return
+            loop.call_soon_threadsafe(pending.put_nowait, (method, payload))
+
+        async def dispatch(method: str, payload: JsonObject) -> None:
+            if on_notification is not None:
+                await on_notification(method, payload)
+            if method != "session.event" or payload.get("sessionId") != session_id:
                 return
             event = payload.get("event")
-            if isinstance(event, dict):
-                loop.call_soon_threadsafe(pending.put_nowait, dict(event))
+            if on_event is not None and isinstance(event, dict):
+                await on_event(dict(event))
 
         worker = asyncio.create_task(
             asyncio.to_thread(
@@ -200,16 +216,16 @@ class _OfficialDshRuntime:
         try:
             while not worker.done():
                 try:
-                    event = await asyncio.wait_for(pending.get(), timeout=0.05)
+                    method, payload = await asyncio.wait_for(pending.get(), timeout=0.05)
                 except TimeoutError:
                     continue
-                if on_event is not None:
-                    await on_event(event)
+                await dispatch(method, payload)
             result = await worker
+            # Let callbacks scheduled from the worker thread enqueue before the final drain.
+            await asyncio.sleep(0)
             while not pending.empty():
-                event = pending.get_nowait()
-                if on_event is not None:
-                    await on_event(event)
+                method, payload = pending.get_nowait()
+                await dispatch(method, payload)
             return DshRunResult(
                 session_id=result.session_id,
                 final_response=result.final_response,
@@ -219,14 +235,21 @@ class _OfficialDshRuntime:
         finally:
             if not worker.done():
                 worker.cancel()
+                # Cancelling an ``asyncio.to_thread`` Task does not stop its
+                # underlying thread. Closing the Harness also terminates its DSH
+                # transport/process so a timed-out owner cannot keep the Session
+                # active indefinitely.
+                with suppress(Exception):
+                    await self.close()
                 with suppress(asyncio.CancelledError):
                     await worker
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        await asyncio.to_thread(self._harness.close)
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            await asyncio.to_thread(self._harness.close)
 
 
 def _optional_int(value: str | None, *, default: int | None) -> int | None:
@@ -250,6 +273,7 @@ def _environment(env_file: str | Path | None) -> dict[str, str]:
 
 __all__ = [
     "DshEventHandler",
+    "DshNotificationHandler",
     "DshRunResult",
     "DshRuntime",
     "DshRuntimeFactory",

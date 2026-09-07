@@ -1,4 +1,4 @@
-"""Typed Python Tools compiled into MCP schemas and governed executions."""
+"""Typed Python Tools exposed by the company SDK."""
 
 from __future__ import annotations
 
@@ -196,7 +196,9 @@ def tool(
     resolved_side_effect = (
         side_effect
         if isinstance(side_effect, SideEffect)
-        else SideEffect.UNSAFE if side_effect else SideEffect.READ_ONLY
+        else SideEffect.UNSAFE
+        if side_effect
+        else SideEffect.READ_ONLY
     )
 
     def decorate(candidate: Callable[..., Any]) -> FunctionTool:

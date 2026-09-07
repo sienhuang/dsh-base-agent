@@ -7,7 +7,7 @@ import json
 import re
 from dataclasses import dataclass
 
-from dsh_base_agent.tools import Tool
+from dsh_base_agent.sdk.tools import Tool
 
 _NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 
@@ -69,4 +69,3 @@ class Agent:
 
 
 __all__ = ["Agent"]
-

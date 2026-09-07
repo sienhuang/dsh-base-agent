@@ -1,43 +1,89 @@
 """Public company SDK for DSH-backed Agent applications."""
 
-from dsh_base_agent.agent import Agent
+from dsh_base_agent.adapters.dsh.runtime import RuntimeConfig
+from dsh_base_agent.adapters.kafka import (
+    DshNotificationEnvelope,
+    KafkaNotificationConfig,
+    KafkaNotificationPublisher,
+    NotificationPublisher,
+    NullNotificationPublisher,
+    PublisherStats,
+    create_notification_publisher,
+    publish_notifications,
+)
 from dsh_base_agent.api import create_app
-from dsh_base_agent.auth import (
+from dsh_base_agent.artifacts import (
+    ArtifactNotFoundError,
+    ArtifactStore,
+    ArtifactStoreConfig,
+    ArtifactStoreError,
+    ArtifactTooLargeError,
+    LocalArtifactStore,
+    StoredArtifact,
+)
+from dsh_base_agent.control.auth import (
     AuthorizationDenied,
     Authorizer,
     Principal,
     ReadOnlyByDefaultAuthorizer,
     ToolAuthorization,
 )
-from dsh_base_agent.control import ControlPlane, RunView
-from dsh_base_agent.models import (
+from dsh_base_agent.control.models import (
     ArtifactRecord,
     AttemptStatus,
     AuditRecord,
     ConversationRecord,
     ConversationStatus,
+    DispatchState,
     EventSource,
     RunAttempt,
     RunEvent,
     RunRecord,
     RunStatus,
+    WorkLease,
+    WorkResourceType,
 )
-from dsh_base_agent.runtime import RuntimeConfig
-from dsh_base_agent.tools import FunctionTool, SideEffect, ToolContext, ToolReadiness, tool
+from dsh_base_agent.control.plane import ControlPlane, RunView
+from dsh_base_agent.sdk import Agent, FunctionTool, SideEffect, ToolContext, ToolReadiness, tool
+from dsh_base_agent.store import (
+    ControlStore,
+    ControlStoreConfig,
+    LeaseLostError,
+    PostgresControlStore,
+    SqliteControlStore,
+)
+from dsh_base_agent.worker import WorkerConfig, WorkerService
 
 __all__ = [
     "Agent",
     "ArtifactRecord",
+    "ArtifactNotFoundError",
+    "ArtifactStore",
+    "ArtifactStoreConfig",
+    "ArtifactStoreError",
+    "ArtifactTooLargeError",
     "AttemptStatus",
     "AuditRecord",
     "AuthorizationDenied",
     "Authorizer",
     "ControlPlane",
+    "ControlStore",
+    "ControlStoreConfig",
     "ConversationRecord",
     "ConversationStatus",
+    "DshNotificationEnvelope",
+    "DispatchState",
     "EventSource",
     "FunctionTool",
+    "KafkaNotificationConfig",
+    "KafkaNotificationPublisher",
+    "LeaseLostError",
+    "LocalArtifactStore",
+    "NotificationPublisher",
+    "NullNotificationPublisher",
     "Principal",
+    "PostgresControlStore",
+    "PublisherStats",
     "ReadOnlyByDefaultAuthorizer",
     "RunAttempt",
     "RunEvent",
@@ -46,9 +92,17 @@ __all__ = [
     "RunView",
     "RuntimeConfig",
     "SideEffect",
+    "SqliteControlStore",
+    "StoredArtifact",
     "ToolAuthorization",
     "ToolContext",
     "ToolReadiness",
+    "WorkLease",
+    "WorkResourceType",
+    "WorkerConfig",
+    "WorkerService",
     "create_app",
+    "create_notification_publisher",
+    "publish_notifications",
     "tool",
 ]

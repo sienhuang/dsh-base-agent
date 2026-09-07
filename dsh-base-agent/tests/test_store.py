@@ -4,7 +4,7 @@ import sqlite3
 
 import pytest
 
-from dsh_base_agent.models import (
+from dsh_base_agent.control.models import (
     ConversationRecord,
     EventSource,
     RunAttempt,
@@ -110,9 +110,9 @@ async def test_store_assigns_conversation_sequences_and_allows_shared_session(tm
         runs.append(run)
 
     assert [run.sequence for run in runs] == [1, 2]
-    assert [run.run_id for run in await store.list_conversation_runs(
-        conversation.conversation_id
-    )] == [run.run_id for run in runs]
+    assert [
+        run.run_id for run in await store.list_conversation_runs(conversation.conversation_id)
+    ] == [run.run_id for run in runs]
 
     for run in runs:
         attempt = RunAttempt(run_id=run.run_id, number=1, dsh_session_id="session-shared")

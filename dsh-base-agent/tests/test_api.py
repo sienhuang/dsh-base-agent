@@ -5,7 +5,12 @@ from pathlib import Path
 from httpx import ASGITransport, AsyncClient
 
 from dsh_base_agent import Agent, ControlPlane, RuntimeConfig, create_app
-from dsh_base_agent.runtime import DshEventHandler, DshRunResult, DshRuntime
+from dsh_base_agent.adapters.dsh.runtime import (
+    DshEventHandler,
+    DshNotificationHandler,
+    DshRunResult,
+    DshRuntime,
+)
 from dsh_base_agent.store import SqliteControlStore
 
 
@@ -16,8 +21,9 @@ class Runtime:
         *,
         session_id: str,
         on_event: DshEventHandler | None = None,
+        on_notification: DshNotificationHandler | None = None,
     ) -> DshRunResult:
-        del input, on_event
+        del input, on_event, on_notification
         return DshRunResult(session_id=session_id, final_response="ok", finish_reason="completed")
 
     async def close(self) -> None:

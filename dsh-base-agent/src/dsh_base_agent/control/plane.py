@@ -4,36 +4,60 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from collections.abc import Mapping
+import logging
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from dsh_base_agent.agent import Agent
-from dsh_base_agent.auth import Authorizer, Principal, ReadOnlyByDefaultAuthorizer
-from dsh_base_agent.gateway import GatewayRunContext, ToolGateway
-from dsh_base_agent.models import (
+from dsh_base_agent.adapters.dsh.runtime import (
+    DshNotificationHandler,
+    DshRuntime,
+    DshRuntimeFactory,
+    OfficialDshRuntimeFactory,
+    RuntimeConfig,
+)
+from dsh_base_agent.adapters.kafka import (
+    DshNotificationEnvelope,
+    NotificationPublisher,
+    NullNotificationPublisher,
+)
+from dsh_base_agent.adapters.mcp.gateway import GatewayRunContext, ToolGateway
+from dsh_base_agent.artifacts import (
+    ArtifactNotFoundError,
+    ArtifactStore,
+    ArtifactStoreConfig,
+)
+from dsh_base_agent.control.auth import Authorizer, Principal, ReadOnlyByDefaultAuthorizer
+from dsh_base_agent.control.models import (
     TERMINAL_RUN_STATUSES,
     ArtifactRecord,
     AttemptStatus,
     AuditRecord,
     ConversationRecord,
     ConversationStatus,
+    DispatchState,
     EventSource,
     RunAttempt,
     RunEvent,
     RunRecord,
     RunStatus,
+    WorkLease,
+    WorkResourceType,
     new_id,
     utc_now,
 )
-from dsh_base_agent.runtime import (
-    DshRuntime,
-    DshRuntimeFactory,
-    OfficialDshRuntimeFactory,
-    RuntimeConfig,
+from dsh_base_agent.sdk.agent import Agent
+from dsh_base_agent.store import (
+    ControlStore,
+    ControlStoreConfig,
+    LeaseLostError,
+    PostgresControlStore,
+    StoreError,
+    request_digest,
 )
-from dsh_base_agent.store import ControlStore, SqliteControlStore, StoreError, request_digest
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class AgentNotFoundError(KeyError):
@@ -79,15 +103,35 @@ class ControlPlane:
         workspace: str | Path,
         runtime: RuntimeConfig,
         store: ControlStore | None = None,
+        store_config: ControlStoreConfig | None = None,
+        artifact_store: ArtifactStore | None = None,
+        artifact_store_config: ArtifactStoreConfig | None = None,
         runtime_factory: DshRuntimeFactory | None = None,
         authorizer: Authorizer | None = None,
+        notification_publisher: NotificationPublisher | None = None,
+        auto_execute: bool = True,
     ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
         self.runtime_config = runtime
-        database = self.workspace / ".dsh-base-agent" / "control.db"
-        self.store = store or SqliteControlStore(database)
+        if store is not None and store_config is not None:
+            raise ValueError("store and store_config cannot both be provided")
+        self.store = store or (store_config or ControlStoreConfig()).create(
+            workspace=self.workspace
+        )
+        if artifact_store is not None and artifact_store_config is not None:
+            raise ValueError("artifact_store and artifact_store_config cannot both be provided")
+        self.artifact_store = artifact_store or (
+            artifact_store_config or ArtifactStoreConfig()
+        ).create(workspace=self.workspace)
+        if auto_execute and isinstance(self.store, PostgresControlStore):
+            raise ValueError(
+                "PostgresControlStore requires auto_execute=False; "
+                "run execution in an independent WorkerService"
+            )
         self.runtime_factory = runtime_factory or OfficialDshRuntimeFactory(runtime)
         self.authorizer = authorizer or ReadOnlyByDefaultAuthorizer()
+        self.notification_publisher = notification_publisher or NullNotificationPublisher()
+        self.auto_execute = auto_execute
         self._agents: dict[str, Agent] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._conversation_tasks: dict[str, asyncio.Task[None]] = {}
@@ -117,8 +161,20 @@ class ControlPlane:
             return
         self.workspace.mkdir(parents=True, exist_ok=True)
         await self.store.initialize()
+        try:
+            await self.artifact_store.initialize()
+        except BaseException:
+            await self.store.close()
+            raise
+        try:
+            await self.notification_publisher.start()
+        except BaseException:
+            await self.artifact_store.close()
+            await self.store.close()
+            raise
         self._started = True
-        await self._recover_startup()
+        if self.auto_execute:
+            await self._recover_startup()
 
     async def close(self) -> None:
         if self._closed:
@@ -149,6 +205,8 @@ class ControlPlane:
         for event in self._run_done.values():
             event.set()
         self._run_done.clear()
+        await self.notification_publisher.close()
+        await self.artifact_store.close()
         await self.store.close()
 
     async def create_conversation(
@@ -316,7 +374,8 @@ class ControlPlane:
                     },
                 )
             )
-            await self._schedule_conversation(conversation_id, persisted.run_id)
+            if self.auto_execute:
+                await self._schedule_conversation(conversation_id, persisted.run_id)
         return persisted
 
     async def submit(
@@ -387,12 +446,18 @@ class ControlPlane:
                     data={"input_sha256": hashlib.sha256(input.encode()).hexdigest()},
                 )
             )
-            await self._schedule(persisted.run_id)
+            if self.auto_execute:
+                await self._schedule(persisted.run_id)
         return persisted
 
     async def wait(self, run_id: str) -> RunRecord:
         await self._ensure_started()
         run = await self.store.get_run(run_id)
+        if not self.auto_execute:
+            while run.status not in TERMINAL_RUN_STATUSES:
+                await asyncio.sleep(0.05)
+                run = await self.store.get_run(run_id)
+            return run
         if run.conversation_id is not None and run.status not in TERMINAL_RUN_STATUSES:
             event = self._run_done.setdefault(run_id, asyncio.Event())
             run = await self.store.get_run(run_id)
@@ -430,6 +495,23 @@ class ControlPlane:
         await self._owned_run(principal, run_id)
         return await self.store.list_artifacts(run_id)
 
+    async def open_artifact(
+        self,
+        principal: Principal,
+        run_id: str,
+        artifact_id: str,
+    ) -> tuple[ArtifactRecord, AsyncIterator[bytes]]:
+        """Authorize a Run-scoped artifact and stream its body from ArtifactStore."""
+
+        await self._ensure_started()
+        await self._owned_run(principal, run_id)
+        records = await self.store.list_artifacts(run_id)
+        try:
+            record = next(item for item in records if item.artifact_id == artifact_id)
+        except StopIteration as exc:
+            raise ArtifactNotFoundError(f"Artifact '{artifact_id}' was not found") from exc
+        return record, await self.artifact_store.open(record.location)
+
     async def cancel(self, principal: Principal, run_id: str) -> RunRecord:
         await self._ensure_started()
         lock = self._run_locks.setdefault(run_id, asyncio.Lock())
@@ -458,6 +540,7 @@ class ControlPlane:
                     settled = attempt.model_copy(
                         update={
                             "status": AttemptStatus.CANCELLED,
+                            "dispatch_state": DispatchState.SETTLED,
                             "revision": attempt.revision + 1,
                             "error": "Run cancellation requested",
                             "finished_at": now,
@@ -535,7 +618,8 @@ class ControlPlane:
             data={"actor": principal.principal_id},
         )
         await self._audit_run(principal, queued, "run.retry", "accepted")
-        await self._schedule(run_id)
+        if self.auto_execute:
+            await self._schedule(run_id)
         return queued
 
     async def resume(
@@ -553,6 +637,59 @@ class ControlPlane:
         raise RunResumeUnsupported(
             "the pinned DSH SDK has no Host session-resume method; refusing to fake a new turn"
         )
+
+    async def execute_leased_work(self, lease: WorkLease) -> bool:
+        """Execute at most one Run fenced to this Worker.
+
+        Returning whether a Run was selected lets the Worker release idle
+        Conversation leases without treating a persisted Session as closed.
+        """
+
+        await self._ensure_started()
+        if self.auto_execute:
+            raise RuntimeError("leased execution requires auto_execute=False")
+        if lease.resource_type is WorkResourceType.RUN:
+            run = await self.store.get_run(lease.resource_id)
+            if run.status is not RunStatus.QUEUED:
+                return False
+            await self._execute(lease.resource_id, lease=lease)
+            return True
+        if lease.resource_type is not WorkResourceType.CONVERSATION:
+            raise ValueError(f"unsupported work resource: {lease.resource_type}")
+        conversation = await self.store.get_conversation(lease.resource_id)
+        if conversation.status is not ConversationStatus.ACTIVE:
+            return False
+        # A Conversation belongs to its persisted DSH Home and Session ID, not to
+        # a particular Worker process.  A replacement Worker deliberately creates
+        # a fresh Harness against those same persisted identifiers and submits the
+        # next Turn; it does not replay an interrupted Run.
+        runs = await self.store.list_conversation_runs(conversation.conversation_id)
+        if any(run.status in {RunStatus.RUNNING, RunStatus.WAITING} for run in runs):
+            return False
+        queued = sorted(
+            (run for run in runs if run.status is RunStatus.QUEUED),
+            key=lambda run: run.sequence or 0,
+        )
+        if not queued:
+            return False
+        await self._execute_conversation_run(
+            conversation,
+            queued[0].run_id,
+            lease=lease,
+        )
+        return True
+
+    async def reconcile_expired_worker_leases(self) -> int:
+        """Atomically settle and record attempts abandoned by expired leases."""
+
+        await self._ensure_started()
+        recovered = await self.store.interrupt_expired_attempts()
+        return len(recovered)
+
+    async def discard_conversation_runtime(self, conversation_id: str) -> None:
+        """Close a sticky Conversation Runtime after its Worker loses ownership."""
+
+        await self._discard_conversation_runtime(conversation_id)
 
     async def _schedule(self, run_id: str) -> None:
         async with self._task_lock:
@@ -574,17 +711,19 @@ class ControlPlane:
             )
             self._conversation_tasks[conversation_id] = task
 
-    async def _drain_conversation(self, conversation_id: str) -> None:
+    async def _drain_conversation(
+        self,
+        conversation_id: str,
+        *,
+        lease: WorkLease | None = None,
+    ) -> None:
         try:
             while not self._closed:
                 conversation = await self.store.get_conversation(conversation_id)
                 if conversation.status is not ConversationStatus.ACTIVE:
                     return
                 runs = await self.store.list_conversation_runs(conversation_id)
-                if any(
-                    run.status in {RunStatus.RUNNING, RunStatus.WAITING}
-                    for run in runs
-                ):
+                if any(run.status in {RunStatus.RUNNING, RunStatus.WAITING} for run in runs):
                     return
                 queued = sorted(
                     (run for run in runs if run.status is RunStatus.QUEUED),
@@ -596,6 +735,7 @@ class ControlPlane:
                 succeeded = await self._execute_conversation_run(
                     conversation,
                     selected.run_id,
+                    lease=lease,
                 )
                 self._run_done.setdefault(selected.run_id, asyncio.Event()).set()
                 if not succeeded:
@@ -608,7 +748,7 @@ class ControlPlane:
             await self._reschedule_conversation_if_needed(conversation_id)
 
     async def _reschedule_conversation_if_needed(self, conversation_id: str) -> None:
-        if self._closed:
+        if self._closed or not self.auto_execute:
             return
         try:
             conversation = await self.store.get_conversation(conversation_id)
@@ -650,6 +790,7 @@ class ControlPlane:
                 interrupted = attempt.model_copy(
                     update={
                         "status": AttemptStatus.INTERRUPTED,
+                        "dispatch_state": DispatchState.UNKNOWN,
                         "revision": attempt.revision + 1,
                         "error": message,
                         "finished_at": now,
@@ -681,25 +822,11 @@ class ControlPlane:
                     data={"reason": "control_plane_restart"},
                 )
             )
-            if run.conversation_id is not None:
-                await self._block_conversation(
-                    run.conversation_id,
-                    "Control plane restarted during an active DSH Turn; "
-                    "Session reconciliation is required",
-                )
-
         active_conversations = await self.store.list_conversations(
             statuses=(ConversationStatus.ACTIVE.value,)
         )
         for conversation in active_conversations:
             runs = await self.store.list_conversation_runs(conversation.conversation_id)
-            if any(run.attempt_count > 0 for run in runs):
-                await self._block_conversation(
-                    conversation.conversation_id,
-                    "Control plane restarted after the DSH Session was opened; "
-                    "the current Python SDK cannot resume it",
-                )
-                continue
             queued = next((run for run in runs if run.status is RunStatus.QUEUED), None)
             if queued is not None:
                 await self._schedule_conversation(
@@ -707,7 +834,7 @@ class ControlPlane:
                     queued.run_id,
                 )
 
-    async def _execute(self, run_id: str) -> None:
+    async def _execute(self, run_id: str, *, lease: WorkLease | None = None) -> None:
         attempt: RunAttempt | None = None
         run: RunRecord | None = None
         gateway: ToolGateway | None = None
@@ -725,6 +852,8 @@ class ControlPlane:
                     run_id=run_id,
                     number=current.attempt_count + 1,
                     dsh_session_id=f"session_{run_id}_{current.attempt_count + 1}",
+                    worker_id=None if lease is None else lease.worker_id,
+                    lease_token=None if lease is None else lease.lease_token,
                 )
                 now = utc_now()
                 run = current.model_copy(
@@ -747,6 +876,7 @@ class ControlPlane:
                     run,
                     attempt,
                     expected_run_revision=current.revision,
+                    lease=lease,
                 )
             await self.store.append_event(
                 run_id=run_id,
@@ -800,6 +930,19 @@ class ControlPlane:
                     )
                 )
 
+            async def write_artifact(
+                name: str,
+                media_type: str,
+                content: bytes,
+            ) -> ArtifactRecord:
+                return await self._store_tool_artifact(
+                    run,
+                    attempt,
+                    name=name,
+                    media_type=media_type,
+                    content=content,
+                )
+
             agent = self._agent(run.agent_id)
             if agent.tools:
                 gateway = ToolGateway(
@@ -807,6 +950,7 @@ class ControlPlane:
                     authorizer=self.authorizer,
                     write_event=write_event,
                     write_audit=write_audit,
+                    write_artifact=write_artifact,
                 )
                 await gateway.start()
                 gateway.bind(
@@ -825,8 +969,22 @@ class ControlPlane:
                 tool_gateway_url=gateway.url if gateway is not None else None,
             )
             self._active_runtimes[run_id] = runtime
+            await self._set_dispatch_state(
+                attempt.attempt_id,
+                DispatchState.DISPATCHING,
+                lease=lease,
+            )
+            dispatch_accepted = False
 
             async def on_dsh_event(event: dict[str, Any]) -> None:
+                nonlocal dispatch_accepted
+                if not dispatch_accepted:
+                    await self._set_dispatch_state(
+                        attempt.attempt_id,
+                        DispatchState.ACCEPTED,
+                        lease=lease,
+                    )
+                    dispatch_accepted = True
                 projected = _project_dsh_event(event)
                 if projected is None:
                     return
@@ -837,18 +995,36 @@ class ControlPlane:
                 run.input,
                 session_id=attempt.dsh_session_id,
                 on_event=on_dsh_event,
+                on_notification=self._notification_handler(run, attempt),
             )
             if result.session_id != attempt.dsh_session_id:
                 raise RuntimeError("DSH returned a different Session ID")
+            if not dispatch_accepted:
+                await self._set_dispatch_state(
+                    attempt.attempt_id,
+                    DispatchState.ACCEPTED,
+                    lease=lease,
+                )
             if result.finish_reason != "completed":
                 raise RuntimeError(f"DSH Run did not complete: {result.finish_reason or 'unknown'}")
-            await self._settle_success(run, attempt, result.final_response, result.finish_reason)
+            await self._settle_success(
+                run,
+                attempt,
+                result.final_response,
+                result.finish_reason,
+                lease=lease,
+            )
         except asyncio.CancelledError:
             # ``cancel`` owns the durable cancellation transition.
             raise
+        except LeaseLostError:
+            return
         except BaseException as exc:
             if run is not None and attempt is not None:
-                await self._settle_failure(run, attempt, exc)
+                try:
+                    await self._settle_failure(run, attempt, exc, lease=lease)
+                except LeaseLostError:
+                    return
         finally:
             self._active_runtimes.pop(run_id, None)
             if runtime is not None:
@@ -862,6 +1038,8 @@ class ControlPlane:
         self,
         conversation: ConversationRecord,
         run_id: str,
+        *,
+        lease: WorkLease | None = None,
     ) -> bool:
         attempt: RunAttempt | None = None
         run: RunRecord | None = None
@@ -875,13 +1053,13 @@ class ControlPlane:
                     return current.status is RunStatus.SUCCEEDED
                 agent = self._agent(current.agent_id)
                 if agent.fingerprint != conversation.agent_fingerprint:
-                    raise RunTransitionError(
-                        "registered Agent no longer matches the Conversation"
-                    )
+                    raise RunTransitionError("registered Agent no longer matches the Conversation")
                 attempt = RunAttempt(
                     run_id=run_id,
                     number=current.attempt_count + 1,
                     dsh_session_id=conversation.dsh_session_id,
+                    worker_id=None if lease is None else lease.worker_id,
+                    lease_token=None if lease is None else lease.lease_token,
                 )
                 now = utc_now()
                 run = current.model_copy(
@@ -904,6 +1082,7 @@ class ControlPlane:
                     run,
                     attempt,
                     expected_run_revision=current.revision,
+                    lease=lease,
                 )
             await self.store.append_event(
                 run_id=run_id,
@@ -964,6 +1143,19 @@ class ControlPlane:
                     )
                 )
 
+            async def write_artifact(
+                name: str,
+                media_type: str,
+                content: bytes,
+            ) -> ArtifactRecord:
+                return await self._store_tool_artifact(
+                    run,
+                    attempt,
+                    name=name,
+                    media_type=media_type,
+                    content=content,
+                )
+
             agent = self._agent(run.agent_id)
             holder = await self._conversation_runtime_holder(
                 conversation,
@@ -979,11 +1171,26 @@ class ControlPlane:
                     ),
                     write_event=write_event,
                     write_audit=write_audit,
+                    write_artifact=write_artifact,
                 )
                 gateway_bound = True
             self._active_runtimes[run_id] = holder.runtime
+            await self._set_dispatch_state(
+                attempt.attempt_id,
+                DispatchState.DISPATCHING,
+                lease=lease,
+            )
+            dispatch_accepted = False
 
             async def on_dsh_event(event: dict[str, Any]) -> None:
+                nonlocal dispatch_accepted
+                if not dispatch_accepted:
+                    await self._set_dispatch_state(
+                        attempt.attempt_id,
+                        DispatchState.ACCEPTED,
+                        lease=lease,
+                    )
+                    dispatch_accepted = True
                 projected = _project_dsh_event(event)
                 if projected is None:
                     return
@@ -994,25 +1201,36 @@ class ControlPlane:
                 run.input,
                 session_id=conversation.dsh_session_id,
                 on_event=on_dsh_event,
+                on_notification=self._notification_handler(run, attempt),
             )
             if result.session_id != conversation.dsh_session_id:
                 raise RuntimeError("DSH returned a different Session ID")
-            if result.finish_reason != "completed":
-                raise RuntimeError(
-                    f"DSH Run did not complete: {result.finish_reason or 'unknown'}"
+            if not dispatch_accepted:
+                await self._set_dispatch_state(
+                    attempt.attempt_id,
+                    DispatchState.ACCEPTED,
+                    lease=lease,
                 )
+            if result.finish_reason != "completed":
+                raise RuntimeError(f"DSH Run did not complete: {result.finish_reason or 'unknown'}")
             await self._settle_success(
                 run,
                 attempt,
                 result.final_response,
                 result.finish_reason,
+                lease=lease,
             )
             return True
         except asyncio.CancelledError:
             raise
+        except LeaseLostError:
+            return False
         except BaseException as exc:
             if run is not None and attempt is not None:
-                await self._settle_failure(run, attempt, exc)
+                try:
+                    await self._settle_failure(run, attempt, exc, lease=lease)
+                except LeaseLostError:
+                    return False
             await self._block_conversation(
                 conversation.conversation_id,
                 f"DSH conversation runtime failed: {type(exc).__name__}",
@@ -1109,6 +1327,8 @@ class ControlPlane:
         started_attempt: RunAttempt,
         output: str,
         finish_reason: str | None,
+        *,
+        lease: WorkLease | None = None,
     ) -> None:
         lock = self._run_locks.setdefault(started_run.run_id, asyncio.Lock())
         async with lock:
@@ -1120,6 +1340,7 @@ class ControlPlane:
             settled_attempt = attempt.model_copy(
                 update={
                     "status": AttemptStatus.SUCCEEDED,
+                    "dispatch_state": DispatchState.SETTLED,
                     "revision": attempt.revision + 1,
                     "finish_reason": finish_reason,
                     "output": output,
@@ -1141,6 +1362,7 @@ class ControlPlane:
                 settled_attempt,
                 expected_run_revision=current.revision,
                 expected_attempt_revision=attempt.revision,
+                lease=lease,
             )
         await self.store.append_event(
             run_id=settled_run.run_id,
@@ -1162,6 +1384,8 @@ class ControlPlane:
         started_run: RunRecord,
         started_attempt: RunAttempt,
         error: BaseException,
+        *,
+        lease: WorkLease | None = None,
     ) -> None:
         lock = self._run_locks.setdefault(started_run.run_id, asyncio.Lock())
         async with lock:
@@ -1174,6 +1398,7 @@ class ControlPlane:
             failed_attempt = attempt.model_copy(
                 update={
                     "status": AttemptStatus.FAILED,
+                    "dispatch_state": DispatchState.SETTLED,
                     "revision": attempt.revision + 1,
                     "error": message,
                     "finished_at": now,
@@ -1193,6 +1418,7 @@ class ControlPlane:
                 failed_attempt,
                 expected_run_revision=current.revision,
                 expected_attempt_revision=attempt.revision,
+                lease=lease,
             )
         await self.store.append_event(
             run_id=failed_run.run_id,
@@ -1210,12 +1436,42 @@ class ControlPlane:
             data={"error_type": type(error).__name__},
         )
 
+    async def _set_dispatch_state(
+        self,
+        attempt_id: str,
+        state: DispatchState,
+        *,
+        lease: WorkLease | None,
+    ) -> RunAttempt:
+        current = await self.store.get_attempt(attempt_id)
+        if (
+            current.status
+            in {
+                AttemptStatus.SUCCEEDED,
+                AttemptStatus.FAILED,
+                AttemptStatus.CANCELLED,
+                AttemptStatus.INTERRUPTED,
+            }
+            or current.dispatch_state is state
+        ):
+            return current
+        updated = current.model_copy(
+            update={
+                "dispatch_state": state,
+                "revision": current.revision + 1,
+                "updated_at": utc_now(),
+            }
+        )
+        await self.store.replace_attempt(
+            updated,
+            expected_revision=current.revision,
+            lease=lease,
+        )
+        return updated
+
     async def _owned_run(self, principal: Principal, run_id: str) -> RunRecord:
         run = await self.store.get_run(run_id)
-        if (
-            run.tenant_id != principal.tenant_id
-            or run.principal_id != principal.principal_id
-        ):
+        if run.tenant_id != principal.tenant_id or run.principal_id != principal.principal_id:
             raise RunAccessDenied("Run belongs to another tenant or principal")
         return run
 
@@ -1229,9 +1485,7 @@ class ControlPlane:
             conversation.tenant_id != principal.tenant_id
             or conversation.principal_id != principal.principal_id
         ):
-            raise ConversationAccessDenied(
-                "Conversation belongs to another tenant or principal"
-            )
+            raise ConversationAccessDenied("Conversation belongs to another tenant or principal")
         return conversation
 
     def _agent(self, agent_id: str) -> Agent:
@@ -1276,6 +1530,65 @@ class ControlPlane:
                 data=data or {},
             )
         )
+
+    async def _store_tool_artifact(
+        self,
+        run: RunRecord,
+        attempt: RunAttempt,
+        *,
+        name: str,
+        media_type: str,
+        content: bytes,
+    ) -> ArtifactRecord:
+        artifact_id = new_id("artifact")
+        stored = await self.artifact_store.put(
+            artifact_id=artifact_id,
+            content=content,
+        )
+        record = ArtifactRecord(
+            artifact_id=artifact_id,
+            run_id=run.run_id,
+            attempt_id=attempt.attempt_id,
+            name=name,
+            media_type=media_type,
+            location=stored.location,
+            sha256=stored.sha256,
+            size_bytes=stored.size_bytes,
+        )
+        try:
+            await self.store.add_artifact(record)
+        except BaseException:
+            try:
+                await self.artifact_store.delete(stored.location)
+            except BaseException:
+                _LOGGER.exception(
+                    "failed to remove orphaned artifact body %s",
+                    artifact_id,
+                )
+            raise
+        return record
+
+    def _notification_handler(
+        self,
+        run: RunRecord,
+        attempt: RunAttempt,
+    ) -> DshNotificationHandler:
+        async def publish(method: str, payload: dict[str, Any]) -> None:
+            await self.notification_publisher.publish(
+                DshNotificationEnvelope(
+                    tenant_id=run.tenant_id,
+                    principal_id=run.principal_id,
+                    agent_id=run.agent_id,
+                    conversation_id=run.conversation_id,
+                    run_id=run.run_id,
+                    attempt_id=attempt.attempt_id,
+                    dsh_session_id=attempt.dsh_session_id,
+                    method=method,
+                    payload=payload,
+                )
+            )
+
+        return publish
 
 
 def _project_dsh_event(event: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:

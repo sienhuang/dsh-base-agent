@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from dsh_base_agent.agent import Agent
-from dsh_base_agent.tools import SideEffect, Tool
+from dsh_base_agent.sdk.agent import Agent
+from dsh_base_agent.sdk.tools import SideEffect, Tool
 
 
 class AuthorizationDenied(PermissionError):
@@ -59,4 +59,3 @@ __all__ = [
     "ReadOnlyByDefaultAuthorizer",
     "ToolAuthorization",
 ]
-

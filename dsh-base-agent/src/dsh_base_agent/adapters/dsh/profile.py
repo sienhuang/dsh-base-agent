@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from uuid import uuid4
 
-from dsh_base_agent.agent import Agent
+from dsh_base_agent.sdk.agent import Agent
 
 
 class ProfileCompilationError(RuntimeError):
@@ -16,7 +16,7 @@ class ProfileCompilationError(RuntimeError):
 
 _NATIVE_TOOL_ROWS = (
     "tool-bash",
-    "tool-pwsh",
+    # "tool-pwsh",
     "tool-jobs",
     "tool-fs",
     "tool-fs-search",
@@ -42,6 +42,7 @@ class DshProfileCompiler:
         self,
         agent: Agent,
         *,
+        workspace: Path,
         dsh_home: Path,
         attempt_id: str,
         tool_gateway_url: str | None,
@@ -52,7 +53,19 @@ class DshProfileCompiler:
             {"id": "system-prompt", "config": {"persona": agent.prompt}}
         ]
         patches.extend({"id": row, "disabled": True} for row in _NATIVE_TOOL_ROWS)
-        if not agent.skills:
+        if agent.skills:
+            # DSH normally resolves project skills from the nearest ancestor that
+            # contains ``.git``. A ControlPlane workspace is commonly nested below
+            # that repository root (for example ``starter/workspace``), so register
+            # its skill root explicitly instead of relying on project discovery.
+            skill_root = (workspace.expanduser().resolve() / ".dsh" / "skills").resolve()
+            patches.append(
+                {
+                    "id": "skill-filesystem",
+                    "config": {"customSkillDirs": [str(skill_root)]},
+                }
+            )
+        else:
             patches.append({"id": "tool-skill", "disabled": True})
         if tool_gateway_url is not None:
             patches.append(
@@ -100,4 +113,3 @@ def _atomic_write(path: Path, content: str) -> None:
 
 
 __all__ = ["DshProfileCompiler", "ProfileCompilationError"]
-
