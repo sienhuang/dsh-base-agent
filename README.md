@@ -15,8 +15,9 @@
 - 官方 `deepseek-harness-sdk` 的窄适配层。
 
 当前代码的逐项完成度见 [`docs/implementation-status.md`](docs/implementation-status.md)。
-业务开发可从 [`starter/`](starter/README.md) 复制一个最小应用，再添加自己的 Tool、Skill、
-静态 Context 和授权策略。
+业务开发先阅读 [`业务 Agent 开发 Guideline`](docs/business-agent-development-guideline.md)，
+再从 [`starter/`](starter/README.md) 复制最小应用并替换自己的 Tool、Skill、Context、Memory
+和授权策略。
 
 源码已按 SDK、Control Plane、Adapter、API 和 Store 边界组织，目录说明和依赖规则见
 [`docs/code-layout.md`](docs/code-layout.md)。
@@ -60,14 +61,14 @@ control = ControlPlane(
 control.register(agent)
 ```
 
-详细架构原则见上级目录的 `docs/dsh-base-agent-positioning.md`。
+详细架构原则见 [`docs/dsh-base-agent-positioning.md`](docs/dsh-base-agent-positioning.md)。
 
 只读 Memory 的身份边界、pre-step 流程、大小限制和 Kafka 写入端过滤规则见
 [`docs/memory-retrieval.md`](docs/memory-retrieval.md)。
 
-Conversation 持有 DSH Session、多个 Run 串行形成多轮对话的 v0.2 方案见
-[`docs/conversation-session-v0.2.md`](docs/conversation-session-v0.2.md)。该文档目前是设计草案，
-现有 v0.1 运行逻辑仍然为每个 RunAttempt 创建独立 Session。
+Conversation 持有 DSH Session、多个 Run 串行形成多轮对话的模型见
+[`docs/conversation-session-v0.2.md`](docs/conversation-session-v0.2.md)。当前独立 Run 的每个
+RunAttempt 使用独立 Session；同一 Conversation 的多个 Run 串行复用固定 Session。
 
 ## 本地运行
 

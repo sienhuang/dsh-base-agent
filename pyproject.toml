@@ -1,6 +1,6 @@
 [project]
 name = "dsh-base-agent"
-version = "0.1.0"
+version = "0.1.1"
 description = "Company Agent application platform and control plane powered by DeepSeek Harness."
 readme = "README.md"
 requires-python = ">=3.12"

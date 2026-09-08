@@ -3,6 +3,28 @@
 这是一个基于当前 `dsh-base-agent` v0.1 的可复制业务应用骨架。它不实现模型循环，运行时仍
 由 DSH 负责。
 
+第一次基于该骨架开发业务 Agent 时，请先阅读
+[`业务 Agent 开发 Guideline`](../docs/business-agent-development-guideline.md)。本文只保留 Starter
+的具体运行和修改示例；权限边界、测试要求、发布检查表和当前能力限制以 Guideline 为准。
+
+仓库内联调时，`pyproject.toml` 使用父目录的 editable SDK。复制 Starter 成为独立业务项目
+后，将依赖来源改成已发布的 Git Tag：
+
+```toml
+[project]
+dependencies = [
+    "dsh-base-agent==0.1.1",
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.30,<1",
+]
+
+[tool.uv.sources]
+dsh-base-agent = { git = "https://github.com/sienhuang/dsh-base-agent.git", tag = "v0.1.1" }
+```
+
+不要复制 `.venv`、`.env` 或 `workspace/.dsh-base-agent`；修改依赖来源后执行 `uv sync` 生成该
+业务项目自己的锁文件。
+
 ## 运行
 
 ```bash

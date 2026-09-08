@@ -1,3 +1,5 @@
+.DS_Store
+.dsh-base-agent/
 .env
 .mypy_cache/
 .pytest_cache/
@@ -6,5 +8,5 @@
 __pycache__/
 *.py[cod]
 dist/
-workspace/.dsh-base-agent/
-
+/dsh-base-agent/
+/dsh-demo/
