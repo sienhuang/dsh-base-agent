@@ -21,6 +21,7 @@ from dsh_base_agent.control.auth import AuthorizationDenied, Principal
 from dsh_base_agent.control.models import (
     ArtifactRecord,
     ConversationStatus,
+    PlanRecord,
     RunAttempt,
     RunEvent,
     RunRecord,
@@ -29,6 +30,8 @@ from dsh_base_agent.control.plane import (
     AgentNotFoundError,
     ControlPlane,
     ConversationAccessDenied,
+    PlanDecisionConflict,
+    PlanDecisionView,
     RunAccessDenied,
     RunResumeUnsupported,
     RunTransitionError,
@@ -37,6 +40,7 @@ from dsh_base_agent.control.plane import (
 from dsh_base_agent.store import (
     ConversationNotFoundError,
     IdempotencyConflictError,
+    PlanNotFoundError,
     RunNotFoundError,
 )
 
@@ -69,11 +73,27 @@ class ResumeRunRequest(BaseModel):
     input: str = Field(min_length=1)
 
 
+class PlanDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    plan_id: str = Field(min_length=1)
+    plan_revision: int = Field(ge=1)
+    plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    comment: str | None = Field(default=None, max_length=4_000)
+
+
 class RunResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     run: RunRecord
     attempts: tuple[RunAttempt, ...] = ()
+
+
+class PlanDecisionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run: RunRecord
+    plan: PlanRecord
 
 
 class ConversationResponse(BaseModel):
@@ -266,6 +286,46 @@ def create_app(
         view = await _view(control, principal, run_id)
         return RunResponse(run=view.run, attempts=view.attempts)
 
+    @app.get("/v1/runs/{run_id}/plan")
+    async def get_plan(
+        run_id: str,
+        principal: Annotated[Principal, Depends(authenticated_principal)],
+    ) -> PlanRecord:
+        try:
+            return await control.get_plan(principal, run_id)
+        except (RunNotFoundError, PlanNotFoundError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RunAccessDenied as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    @app.post("/v1/runs/{run_id}/approve", status_code=status.HTTP_202_ACCEPTED)
+    async def approve_plan(
+        run_id: str,
+        request: PlanDecisionRequest,
+        principal: Annotated[Principal, Depends(authenticated_principal)],
+    ) -> PlanDecisionResponse:
+        view = await _plan_decision(
+            control.approve_plan,
+            principal,
+            run_id,
+            request,
+        )
+        return PlanDecisionResponse(run=view.run, plan=view.plan)
+
+    @app.post("/v1/runs/{run_id}/reject")
+    async def reject_plan(
+        run_id: str,
+        request: PlanDecisionRequest,
+        principal: Annotated[Principal, Depends(authenticated_principal)],
+    ) -> PlanDecisionResponse:
+        view = await _plan_decision(
+            control.reject_plan,
+            principal,
+            run_id,
+            request,
+        )
+        return PlanDecisionResponse(run=view.run, plan=view.plan)
+
     @app.get("/v1/runs/{run_id}/events")
     async def get_events(
         run_id: str,
@@ -385,11 +445,36 @@ async def _transition(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+async def _plan_decision(
+    operation: Callable[..., Awaitable[PlanDecisionView]],
+    principal: Principal,
+    run_id: str,
+    request: PlanDecisionRequest,
+) -> PlanDecisionView:
+    try:
+        return await operation(
+            principal,
+            run_id,
+            plan_id=request.plan_id,
+            plan_revision=request.plan_revision,
+            plan_sha256=request.plan_sha256,
+            comment=request.comment,
+        )
+    except (RunNotFoundError, PlanNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RunAccessDenied as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except PlanDecisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 __all__ = [
     "CreateConversationRequest",
     "CreateConversationRunRequest",
     "CreateRunRequest",
     "ConversationResponse",
+    "PlanDecisionRequest",
+    "PlanDecisionResponse",
     "ResumeRunRequest",
     "RunResponse",
     "create_app",

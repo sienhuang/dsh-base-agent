@@ -12,6 +12,7 @@
 - 稳定的 FastAPI Run API；
 - 追加式运行事件和独立审计记录；
 - Tool 大结果的本地 ArtifactStore 和流式下载；
+- 模型结构化规划、持久化人工审批和 Host 直接启动 DSH Workflow 的 Plan-ReAct；
 - 官方 `deepseek-harness-sdk` 的窄适配层。
 
 当前代码的逐项完成度见 [`docs/implementation-status.md`](docs/implementation-status.md)。
@@ -197,6 +198,9 @@ GET    /v1/runs/{run_id}/events
 POST   /v1/runs/{run_id}/cancel
 POST   /v1/runs/{run_id}/retry
 POST   /v1/runs/{run_id}/resume
+GET    /v1/runs/{run_id}/plan
+POST   /v1/runs/{run_id}/approve
+POST   /v1/runs/{run_id}/reject
 GET    /v1/runs/{run_id}/artifacts
 GET    /v1/runs/{run_id}/artifacts/{artifact_id}/content
 
@@ -214,6 +218,10 @@ Tool 返回 JSON 超过 64 KiB 时，完整正文默认写入
 `POST /v1/runs` 保持单次独立 Session 语义。需要多轮上下文时，先创建 Conversation，再向
 Conversation 连续提交 Run。同一 Conversation 固定绑定 Tenant、Principal、Agent 版本、DSH
 Home 和 Session ID，并在当前 ControlPlane 进程内严格串行执行。
+
+需要先规划、再人工审批、最后由 Host 确定性启动 DSH Workflow 时，在 Agent 上设置
+`plan_react=PlanReact()`。模型只提交结构化 DAG，Workflow JavaScript 使用 base-agent 固定
+模板；具体状态机、摘要校验和当前兼容边界见 [`docs/plan-react.md`](docs/plan-react.md)。
 
 ## 安全默认值
 

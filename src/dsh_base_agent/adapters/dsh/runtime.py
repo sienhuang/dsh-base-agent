@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import os
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 from dotenv import dotenv_values
+from pydantic import BaseModel
 
 from dsh_base_agent.adapters.dsh.profile import DshProfileCompiler
 from dsh_base_agent.sdk.agent import Agent
@@ -88,6 +91,34 @@ class DshRunResult:
     events: tuple[JsonObject, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class DshWorkflowRequest:
+    workflow_id: str
+    workflow_version: str
+    script: str
+    script_sha256: str
+    args: JsonObject
+    args_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class DshWorkflowResult:
+    session_id: str
+    workflow_run_id: str
+    stop_reason: str
+    agents_started: int
+    value: Any
+    error: str | None = None
+
+
+class _WorkflowRpcResponse(BaseModel):
+    runId: str
+    stopReason: str
+    agentsStarted: int
+    value: Any
+    error: str | None = None
+
+
 @runtime_checkable
 class DshRuntime(Protocol):
     async def run(
@@ -98,6 +129,14 @@ class DshRuntime(Protocol):
         on_event: DshEventHandler | None = None,
         on_notification: DshNotificationHandler | None = None,
     ) -> DshRunResult: ...
+
+    async def execute_workflow(
+        self,
+        request: DshWorkflowRequest,
+        *,
+        session_id: str,
+        on_notification: DshNotificationHandler | None = None,
+    ) -> DshWorkflowResult: ...
 
     async def close(self) -> None: ...
 
@@ -250,6 +289,90 @@ class _OfficialDshRuntime:
                 with suppress(asyncio.CancelledError):
                     await worker
 
+    async def execute_workflow(
+        self,
+        request: DshWorkflowRequest,
+        *,
+        session_id: str,
+        on_notification: DshNotificationHandler | None = None,
+    ) -> DshWorkflowResult:
+        if self._closed:
+            raise RuntimeError("DSH Runtime is closed")
+        loop = asyncio.get_running_loop()
+        pending: asyncio.Queue[tuple[str, JsonObject]] = asyncio.Queue()
+
+        def receive(notification: Any) -> None:
+            method = getattr(notification, "method", None)
+            raw_payload = getattr(notification, "payload", None)
+            if not isinstance(method, str) or not isinstance(raw_payload, Mapping):
+                return
+            loop.call_soon_threadsafe(pending.put_nowait, (method, dict(raw_payload)))
+
+        def invoke() -> _WorkflowRpcResponse:
+            args_json = json.dumps(
+                request.args,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if hashlib.sha256(args_json.encode()).hexdigest() != request.args_sha256:
+                raise ValueError("Workflow args sha256 does not match the approved value")
+            self._harness.start()
+            return cast(
+                _WorkflowRpcResponse,
+                self._harness.client.request(
+                    "base-agent/workflow.execute",
+                    {
+                        "sessionId": session_id,
+                        "meta": {
+                            "name": request.workflow_id,
+                            "description": (
+                                "Execute the approved dsh-base-agent Plan-ReAct Workflow "
+                                f"version {request.workflow_version}"
+                            ),
+                        },
+                        "script": request.script,
+                        "scriptSha256": request.script_sha256,
+                        "argsJson": args_json,
+                        "argsSha256": request.args_sha256,
+                    },
+                    response_model=_WorkflowRpcResponse,
+                    timeout_seconds=self._harness.config.request_timeout_seconds,
+                    on_notification=receive,
+                ),
+            )
+
+        worker = asyncio.create_task(asyncio.to_thread(invoke))
+        try:
+            while not worker.done():
+                try:
+                    method, payload = await asyncio.wait_for(pending.get(), timeout=0.05)
+                except TimeoutError:
+                    continue
+                if on_notification is not None:
+                    await on_notification(method, payload)
+            result = await worker
+            await asyncio.sleep(0)
+            while not pending.empty():
+                method, payload = pending.get_nowait()
+                if on_notification is not None:
+                    await on_notification(method, payload)
+            return DshWorkflowResult(
+                session_id=session_id,
+                workflow_run_id=result.runId,
+                stop_reason=result.stopReason,
+                agents_started=result.agentsStarted,
+                value=result.value,
+                error=result.error,
+            )
+        finally:
+            if not worker.done():
+                worker.cancel()
+                with suppress(Exception):
+                    await self.close()
+                with suppress(asyncio.CancelledError):
+                    await worker
+
     async def close(self) -> None:
         async with self._close_lock:
             if self._closed:
@@ -283,6 +406,8 @@ __all__ = [
     "DshRunResult",
     "DshRuntime",
     "DshRuntimeFactory",
+    "DshWorkflowRequest",
+    "DshWorkflowResult",
     "OfficialDshRuntimeFactory",
     "RuntimeConfig",
 ]

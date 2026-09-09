@@ -49,13 +49,21 @@ export function apply(ctx, config) {
       return decision
     }
     try {
+      // Workflow/subagent Sessions carry the governed root Session in
+      // parentSession. Use that stable id so parallel children share the
+      // attempt-scoped binding and its single cached retrieval.
+      const header = agent.session.header
+      const sessionId = (
+        typeof header.parentSession === 'string'
+        && header.parentSession.length > 0
+      ) ? header.parentSession : header.id
       const response = await fetch(config.url, {
         method: 'POST',
         headers: {
           authorization: `Bearer ${config.token}`,
           'content-type': 'application/json',
         },
-        body: JSON.stringify({ session_id: agent.session.header.id }),
+        body: JSON.stringify({ session_id: sessionId }),
         signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
       })
       if (!response.ok) {

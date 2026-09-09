@@ -119,6 +119,57 @@ curl http://127.0.0.1:8000/v1/runs/{run_id} \
   -H 'X-Principal-ID: demo-user'
 ```
 
+## Plan-ReAct 与人工审批
+
+Starter 同时注册了 `iris-plan-react-1`。它与普通订单 Agent 使用相同的业务 Tool，但设置了
+`plan_react=PlanReact(max_steps=6)`。此模式有两个独立 Attempt：
+
+1. planning：模型只能使用只读 Tool，并且必须通过 `submit_plan` 提交结构化 DAG；
+2. executing：Run 等待人工审批后，由 base-agent 直接调用 DSH Workflow Engine 执行已批准 DAG。
+
+业务开发者不需要在 Agent 定义里手写 Workflow JavaScript。模型只生成结构化的步骤、依赖关系
+和所需 Tool 名称；base-agent 使用版本化的固定模板编译脚本，并将 Plan、模板哈希和参数哈希一起
+持久化。审批必须回传读取到的 `plan_id`、`revision` 和 `plan_sha256`，所以不能误批已经变化的
+计划。
+
+启动 API（PostgreSQL 模式还要启动 Worker）后，可直接运行完整冒烟测试：
+
+```bash
+uv run python scripts/plan_react_smoke.py
+```
+
+也可以手工调用。先提交：
+
+```bash
+curl -sS -X POST http://127.0.0.1:8000/v1/runs \
+  -H 'Content-Type: application/json' \
+  -H 'X-Tenant-ID: demo-tenant' \
+  -H 'X-Principal-ID: demo-user' \
+  -d '{"agent_id":"iris-plan-react-1","input":"查询 order-001 并给出状态"}'
+```
+
+Run 进入 `status=waiting, phase=waiting_approval` 后读取 Plan：
+
+```bash
+curl -sS http://127.0.0.1:8000/v1/runs/{run_id}/plan \
+  -H 'X-Tenant-ID: demo-tenant' \
+  -H 'X-Principal-ID: demo-user'
+```
+
+再把响应中的三个并发控制字段原样提交到审批接口：
+
+```bash
+curl -sS -X POST http://127.0.0.1:8000/v1/runs/{run_id}/approve \
+  -H 'Content-Type: application/json' \
+  -H 'X-Tenant-ID: demo-tenant' \
+  -H 'X-Principal-ID: demo-user' \
+  -d '{"plan_id":"plan_...","plan_revision":1,"plan_sha256":"...","comment":"同意"}'
+```
+
+拒绝时使用相同请求体调用 `/v1/runs/{run_id}/reject`。Plan-ReAct 当前只支持独立
+`POST /v1/runs`，不支持 Conversation，因为人工审批可能跨进程、跨较长时间，不应依赖一个仍然
+存活的 Conversation Runtime。
+
 查看和下载大 Tool Result：
 
 ```bash

@@ -19,7 +19,7 @@ from dsh_base_agent import (
 from fastapi import FastAPI
 
 from company_agent.authorization import StarterAuthorizer
-from company_agent.definition import build_agent
+from company_agent.definition import build_agents
 
 
 def build_control(
@@ -52,7 +52,8 @@ def build_control(
         authorizer=StarterAuthorizer(),
         auto_execute=auto_execute,
     )
-    control.register(build_agent())
+    for agent in build_agents():
+        control.register(agent)
     return control
 
 

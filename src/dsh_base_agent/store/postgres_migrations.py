@@ -182,6 +182,33 @@ POSTGRES_MIGRATIONS: tuple[tuple[int, str, str], ...] = (
         CREATE INDEX ix_outbox_publishable ON outbox(status, available_at, outbox_id);
         """,
     ),
+    (
+        2,
+        "plan_react",
+        """
+        CREATE TABLE plans (
+            plan_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL UNIQUE REFERENCES runs(run_id),
+            status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected')),
+            revision INTEGER NOT NULL CHECK (revision >= 1),
+            plan_sha256 TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL,
+            payload JSONB NOT NULL
+        );
+        CREATE INDEX ix_plans_run_status ON plans(run_id, status);
+        """,
+    ),
+    (
+        3,
+        "completed_run_phase",
+        """
+        UPDATE runs
+        SET payload = jsonb_set(payload, '{phase}', '"completed"'::jsonb, true)
+        WHERE status = 'succeeded'
+          AND payload->>'phase' IS DISTINCT FROM 'completed';
+        """,
+    ),
 )
 
 

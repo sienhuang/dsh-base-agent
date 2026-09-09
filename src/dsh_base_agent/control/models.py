@@ -27,6 +27,14 @@ class RunStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class RunPhase(StrEnum):
+    DIRECT = "direct"
+    PLANNING = "planning"
+    WAITING_APPROVAL = "waiting_approval"
+    EXECUTING = "executing"
+    COMPLETED = "completed"
+
+
 class AttemptStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
@@ -60,6 +68,12 @@ class EventSource(StrEnum):
     CONTROL = "control"
     DSH = "dsh"
     TOOL = "tool"
+
+
+class PlanStatus(StrEnum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
 
 
 class ConversationRecord(BaseModel):
@@ -99,6 +113,8 @@ class RunRecord(BaseModel):
     agent_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     input: str = Field(min_length=1)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    phase: RunPhase = RunPhase.DIRECT
+    plan_id: str | None = None
     status: RunStatus = RunStatus.QUEUED
     revision: int = Field(default=1, ge=1)
     attempt_count: int = Field(default=0, ge=0)
@@ -119,6 +135,7 @@ class RunAttempt(BaseModel):
     run_id: str
     number: int = Field(ge=1)
     dsh_session_id: str = Field(min_length=1)
+    phase: RunPhase = RunPhase.DIRECT
     status: AttemptStatus = AttemptStatus.QUEUED
     dispatch_state: DispatchState = DispatchState.NOT_SENT
     worker_id: str | None = None
@@ -180,6 +197,41 @@ class ArtifactRecord(BaseModel):
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     size_bytes: int = Field(ge=0)
     created_at: datetime = Field(default_factory=utc_now)
+
+
+class PlanStep(BaseModel):
+    """One approved unit in a compiled Workflow dependency graph."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    step_id: str = Field(pattern=r"^[A-Za-z0-9_.-]+$")
+    task: str = Field(min_length=1, max_length=4_000)
+    depends_on: tuple[str, ...] = ()
+
+
+class PlanRecord(BaseModel):
+    """Durable plan plus the exact compiled Workflow identity approved for execution."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    plan_id: str = Field(default_factory=lambda: new_id("plan"))
+    run_id: str
+    status: PlanStatus = PlanStatus.PENDING
+    revision: int = Field(default=1, ge=1)
+    summary: str = Field(min_length=1, max_length=8_000)
+    steps: tuple[PlanStep, ...] = Field(min_length=1)
+    requested_tools: tuple[str, ...] = ()
+    workflow_id: str = Field(min_length=1)
+    workflow_version: str = Field(min_length=1)
+    workflow_script_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    workflow_args: dict[str, Any]
+    workflow_args_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    decided_by: str | None = None
+    decision_comment: str | None = None
+    decided_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
 
 class WorkLease(BaseModel):

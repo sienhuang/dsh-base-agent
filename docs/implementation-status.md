@@ -30,6 +30,8 @@
   Worker 使用相同持久化 DSH Home 和 Session ID 重建 Runtime；
 - `.env` Runtime 配置；
 - 启动时重新调度 `QUEUED` Run，并保守中断旧 `RUNNING` Attempt。
+- 独立 Run 的 Plan-ReAct：只读 planning、结构化 DAG、Plan/脚本/参数摘要、持久化人工审批、
+  精确 revision/hash 防误批，以及 Host JSON-RPC 直接启动 DSH Workflow；
 
 ## 部分实现
 
@@ -53,13 +55,16 @@
 - 更完整的 Worker 调度优先级、限流和跨机房治理；
 - S3 Workspace Backend、本地物化和版本提交；
 - Memory 写入、生命周期治理、质量评估和外部服务可靠消费；
-- WAITING/Approval 的完整恢复流程；
+- DSH 单个 live Turn 内暂停/审批以及被中断原 Turn的完整恢复流程；
 - 分布式配额和生产 SLA。
 
 Resume 扩展的后续方向保持不变：通过公司自有 DSH 插件和版本化 JSON-RPC 扩展，把 Session
 状态、原 Turn 对账和审批 answerer 适配给 Python 控制面。详细边界和实施阶段见
 [`dsh-resume-extension.md`](dsh-resume-extension.md)。普通的 Worker 换手和“恢复被中断的原
 Turn”是两种能力；当前版本只支持前者。
+
+Plan-ReAct 已实现的是两个独立 Attempt 之间的持久化审批点，不依赖 live Turn 恢复，详见
+[`plan-react.md`](plan-react.md)。
 
 可复制业务骨架见 [`../starter/`](../starter/README.md)。
 

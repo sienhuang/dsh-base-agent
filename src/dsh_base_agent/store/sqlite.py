@@ -16,6 +16,7 @@ from dsh_base_agent.control.models import (
     ConversationRecord,
     ConversationStatus,
     EventSource,
+    PlanRecord,
     RunAttempt,
     RunEvent,
     RunRecord,
@@ -48,6 +49,10 @@ class IdempotencyConflictError(StoreError):
 
 
 class LeaseLostError(StoreError):
+    pass
+
+
+class PlanNotFoundError(StoreError):
     pass
 
 
@@ -127,6 +132,28 @@ class ControlStore(Protocol):
 
     async def list_attempts(self, run_id: str) -> tuple[RunAttempt, ...]: ...
 
+    async def get_plan(self, run_id: str) -> PlanRecord: ...
+
+    async def complete_planning(
+        self,
+        run: RunRecord,
+        attempt: RunAttempt,
+        plan: PlanRecord,
+        *,
+        expected_run_revision: int,
+        expected_attempt_revision: int,
+        lease: WorkLease | None = None,
+    ) -> None: ...
+
+    async def decide_plan(
+        self,
+        run: RunRecord,
+        plan: PlanRecord,
+        *,
+        expected_run_revision: int,
+        expected_plan_revision: int,
+    ) -> None: ...
+
     async def append_event(
         self,
         *,
@@ -188,6 +215,7 @@ class SqliteControlStore:
             connection.execute("PRAGMA foreign_keys=ON")
             connection.executescript(_SCHEMA)
             _drop_session_id_uniqueness(connection)
+            _normalize_succeeded_run_phases(connection)
             self._connection = connection
 
     async def close(self) -> None:
@@ -661,6 +689,142 @@ class SqliteControlStore:
             )
             return tuple(RunAttempt.model_validate_json(row["payload"]) for row in rows)
 
+    async def get_plan(self, run_id: str) -> PlanRecord:
+        async with self._lock:
+            row = (
+                self._require_connection()
+                .execute("SELECT payload FROM plans WHERE run_id = ?", (run_id,))
+                .fetchone()
+            )
+            if row is None:
+                raise PlanNotFoundError(f"Plan for Run '{run_id}' was not found")
+            return PlanRecord.model_validate_json(row["payload"])
+
+    async def complete_planning(
+        self,
+        run: RunRecord,
+        attempt: RunAttempt,
+        plan: PlanRecord,
+        *,
+        expected_run_revision: int,
+        expected_attempt_revision: int,
+        lease: WorkLease | None = None,
+    ) -> None:
+        if lease is not None:
+            raise StoreError("distributed Worker fencing requires PostgreSQL")
+        if run.revision != expected_run_revision + 1:
+            raise ValueError("replacement Run revision must increment by one")
+        if attempt.revision != expected_attempt_revision + 1:
+            raise ValueError("replacement RunAttempt revision must increment by one")
+        if plan.run_id != run.run_id or attempt.run_id != run.run_id:
+            raise ValueError("planning records must belong to the same Run")
+        async with self._lock:
+            connection = self._require_connection()
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                attempt_result = connection.execute(
+                    """
+                    UPDATE run_attempts SET status = ?, revision = ?, payload = ?
+                    WHERE attempt_id = ? AND revision = ?
+                    """,
+                    (
+                        attempt.status.value,
+                        attempt.revision,
+                        attempt.model_dump_json(),
+                        attempt.attempt_id,
+                        expected_attempt_revision,
+                    ),
+                )
+                if attempt_result.rowcount != 1:
+                    raise RevisionConflictError(
+                        f"RunAttempt '{attempt.attempt_id}' changed concurrently"
+                    )
+                run_result = connection.execute(
+                    """
+                    UPDATE runs SET status = ?, revision = ?, payload = ?
+                    WHERE run_id = ? AND revision = ?
+                    """,
+                    (
+                        run.status.value,
+                        run.revision,
+                        run.model_dump_json(),
+                        run.run_id,
+                        expected_run_revision,
+                    ),
+                )
+                if run_result.rowcount != 1:
+                    raise RevisionConflictError(f"Run '{run.run_id}' changed concurrently")
+                connection.execute(
+                    """
+                    INSERT INTO plans(plan_id, run_id, status, revision, payload)
+                    VALUES(?,?,?,?,?)
+                    """,
+                    (
+                        plan.plan_id,
+                        plan.run_id,
+                        plan.status.value,
+                        plan.revision,
+                        plan.model_dump_json(),
+                    ),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+    async def decide_plan(
+        self,
+        run: RunRecord,
+        plan: PlanRecord,
+        *,
+        expected_run_revision: int,
+        expected_plan_revision: int,
+    ) -> None:
+        if run.revision != expected_run_revision + 1:
+            raise ValueError("replacement Run revision must increment by one")
+        if plan.revision != expected_plan_revision + 1:
+            raise ValueError("replacement Plan revision must increment by one")
+        if plan.run_id != run.run_id:
+            raise ValueError("Plan must belong to the Run being decided")
+        async with self._lock:
+            connection = self._require_connection()
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                plan_result = connection.execute(
+                    """
+                    UPDATE plans SET status = ?, revision = ?, payload = ?
+                    WHERE plan_id = ? AND revision = ?
+                    """,
+                    (
+                        plan.status.value,
+                        plan.revision,
+                        plan.model_dump_json(),
+                        plan.plan_id,
+                        expected_plan_revision,
+                    ),
+                )
+                if plan_result.rowcount != 1:
+                    raise RevisionConflictError(f"Plan '{plan.plan_id}' changed concurrently")
+                run_result = connection.execute(
+                    """
+                    UPDATE runs SET status = ?, revision = ?, payload = ?
+                    WHERE run_id = ? AND revision = ?
+                    """,
+                    (
+                        run.status.value,
+                        run.revision,
+                        run.model_dump_json(),
+                        run.run_id,
+                        expected_run_revision,
+                    ),
+                )
+                if run_result.rowcount != 1:
+                    raise RevisionConflictError(f"Run '{run.run_id}' changed concurrently")
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
     async def append_event(
         self,
         *,
@@ -890,6 +1054,15 @@ CREATE TABLE IF NOT EXISTS run_attempts (
 );
 CREATE INDEX IF NOT EXISTS ix_run_attempts_session ON run_attempts(session_id);
 
+CREATE TABLE IF NOT EXISTS plans (
+    plan_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL UNIQUE REFERENCES runs(run_id),
+    status TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_plans_run_status ON plans(run_id, status);
+
 CREATE TABLE IF NOT EXISTS run_events (
     event_id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL REFERENCES runs(run_id),
@@ -964,12 +1137,34 @@ def _drop_session_id_uniqueness(connection: sqlite3.Connection) -> None:
         connection.execute("PRAGMA foreign_keys=ON")
 
 
+def _normalize_succeeded_run_phases(connection: sqlite3.Connection) -> None:
+    """Backfill the terminal phase introduced after Plan-ReAct's first release."""
+
+    rows = connection.execute(
+        "SELECT run_id, payload FROM runs WHERE status = 'succeeded'"
+    ).fetchall()
+    for row in rows:
+        payload = json.loads(row["payload"])
+        if payload.get("phase") == "completed":
+            continue
+        payload["phase"] = "completed"
+        connection.execute(
+            "UPDATE runs SET payload = ? WHERE run_id = ?",
+            (
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                row["run_id"],
+            ),
+        )
+    connection.commit()
+
+
 __all__ = [
     "AttemptNotFoundError",
     "ConversationNotFoundError",
     "ControlStore",
     "IdempotencyConflictError",
     "LeaseLostError",
+    "PlanNotFoundError",
     "RevisionConflictError",
     "RunNotFoundError",
     "SqliteControlStore",

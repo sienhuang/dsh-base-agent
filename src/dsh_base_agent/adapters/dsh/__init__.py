@@ -6,6 +6,8 @@ from dsh_base_agent.adapters.dsh.runtime import (
     DshRunResult,
     DshRuntime,
     DshRuntimeFactory,
+    DshWorkflowRequest,
+    DshWorkflowResult,
     OfficialDshRuntimeFactory,
     RuntimeConfig,
 )
@@ -16,6 +18,8 @@ __all__ = [
     "DshRunResult",
     "DshRuntime",
     "DshRuntimeFactory",
+    "DshWorkflowRequest",
+    "DshWorkflowResult",
     "OfficialDshRuntimeFactory",
     "ProfileCompilationError",
     "RuntimeConfig",

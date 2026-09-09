@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from dsh_base_agent.adapters.dsh.runtime import (
     DshNotificationHandler,
     DshRuntime,
     DshRuntimeFactory,
+    DshWorkflowRequest,
     OfficialDshRuntimeFactory,
     RuntimeConfig,
 )
@@ -42,14 +44,27 @@ from dsh_base_agent.control.models import (
     ConversationStatus,
     DispatchState,
     EventSource,
+    PlanRecord,
+    PlanStatus,
     RunAttempt,
     RunEvent,
+    RunPhase,
     RunRecord,
     RunStatus,
     WorkLease,
     WorkResourceType,
     new_id,
     utc_now,
+)
+from dsh_base_agent.control.plan_react import (
+    CompiledWorkflow,
+    PlanCompilationError,
+    PlanningAuthorizer,
+    PlanSubmissionCollector,
+    compile_plan,
+    compiled_workflow,
+    execution_agent,
+    planning_agent,
 )
 from dsh_base_agent.sdk.agent import Agent
 from dsh_base_agent.store import (
@@ -84,10 +99,20 @@ class RunResumeUnsupported(RunTransitionError):
     pass
 
 
+class PlanDecisionConflict(RunTransitionError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class RunView:
     run: RunRecord
     attempts: tuple[RunAttempt, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PlanDecisionView:
+    run: RunRecord
+    plan: PlanRecord
 
 
 @dataclass(slots=True)
@@ -144,6 +169,7 @@ class ControlPlane:
         self._run_done: dict[str, asyncio.Event] = {}
         self._active_runtimes: dict[str, DshRuntime] = {}
         self._run_locks: dict[str, asyncio.Lock] = {}
+        self._deferred_schedules: set[str] = set()
         self._task_lock = asyncio.Lock()
         self._started = False
         self._closed = False
@@ -219,6 +245,7 @@ class ControlPlane:
         for event in self._run_done.values():
             event.set()
         self._run_done.clear()
+        self._deferred_schedules.clear()
         await self.notification_publisher.close()
         await self.artifact_store.close()
         await self.store.close()
@@ -313,6 +340,11 @@ class ControlPlane:
         if not input.strip():
             raise ValueError("Run input must not be blank")
         agent = self._agent(conversation.agent_id)
+        if agent.plan_react is not None:
+            raise RunTransitionError(
+                "Plan-ReAct currently requires a standalone Run because approval may "
+                "outlive the live DSH Conversation Session"
+            )
         if agent.fingerprint != conversation.agent_fingerprint:
             raise RunTransitionError("registered Agent no longer matches the Conversation")
         try:
@@ -427,6 +459,7 @@ class ControlPlane:
             agent_fingerprint=agent.fingerprint,
             input=input,
             metadata=metadata or {},
+            phase=(RunPhase.PLANNING if agent.plan_react is not None else RunPhase.DIRECT),
         )
         digest = request_digest(
             {
@@ -468,7 +501,7 @@ class ControlPlane:
         await self._ensure_started()
         run = await self.store.get_run(run_id)
         if not self.auto_execute:
-            while run.status not in TERMINAL_RUN_STATUSES:
+            while run.status not in {*TERMINAL_RUN_STATUSES, RunStatus.WAITING}:
                 await asyncio.sleep(0.05)
                 run = await self.store.get_run(run_id)
             return run
@@ -488,6 +521,57 @@ class ControlPlane:
         await self._ensure_started()
         run = await self._owned_run(principal, run_id)
         return RunView(run=run, attempts=await self.store.list_attempts(run_id))
+
+    async def get_plan(self, principal: Principal, run_id: str) -> PlanRecord:
+        """Return the immutable proposal and its current approval decision."""
+
+        await self._ensure_started()
+        await self._owned_run(principal, run_id)
+        return await self.store.get_plan(run_id)
+
+    async def approve_plan(
+        self,
+        principal: Principal,
+        run_id: str,
+        *,
+        plan_id: str,
+        plan_revision: int,
+        plan_sha256: str,
+        comment: str | None = None,
+    ) -> PlanDecisionView:
+        """Approve exactly the proposal the caller inspected, then queue execution."""
+
+        return await self._decide_plan(
+            principal,
+            run_id,
+            plan_id=plan_id,
+            plan_revision=plan_revision,
+            plan_sha256=plan_sha256,
+            approved=True,
+            comment=comment,
+        )
+
+    async def reject_plan(
+        self,
+        principal: Principal,
+        run_id: str,
+        *,
+        plan_id: str,
+        plan_revision: int,
+        plan_sha256: str,
+        comment: str | None = None,
+    ) -> PlanDecisionView:
+        """Reject exactly the proposal the caller inspected and cancel the Run."""
+
+        return await self._decide_plan(
+            principal,
+            run_id,
+            plan_id=plan_id,
+            plan_revision=plan_revision,
+            plan_sha256=plan_sha256,
+            approved=False,
+            comment=comment,
+        )
 
     async def events(
         self,
@@ -528,6 +612,7 @@ class ControlPlane:
 
     async def cancel(self, principal: Principal, run_id: str) -> RunRecord:
         await self._ensure_started()
+        cancelled_plan: PlanRecord | None = None
         lock = self._run_locks.setdefault(run_id, asyncio.Lock())
         async with lock:
             current = await self._owned_run(principal, run_id)
@@ -537,13 +622,36 @@ class ControlPlane:
             cancelled = current.model_copy(
                 update={
                     "status": RunStatus.CANCELLED,
+                    "active_attempt_id": (
+                        None
+                        if current.phase is RunPhase.WAITING_APPROVAL
+                        else current.active_attempt_id
+                    ),
                     "cancel_requested": True,
                     "revision": current.revision + 1,
                     "error": "Run cancellation requested",
                     "updated_at": now,
                 }
             )
-            if current.active_attempt_id is not None:
+            if current.phase is RunPhase.WAITING_APPROVAL:
+                plan = await self.store.get_plan(run_id)
+                cancelled_plan = plan.model_copy(
+                    update={
+                        "status": PlanStatus.REJECTED,
+                        "revision": plan.revision + 1,
+                        "decided_by": principal.principal_id,
+                        "decision_comment": "Run cancellation requested",
+                        "decided_at": now,
+                        "updated_at": now,
+                    }
+                )
+                await self.store.decide_plan(
+                    cancelled,
+                    cancelled_plan,
+                    expected_run_revision=current.revision,
+                    expected_plan_revision=plan.revision,
+                )
+            elif current.active_attempt_id is not None:
                 attempt = await self.store.get_attempt(current.active_attempt_id)
                 if attempt.status not in {
                     AttemptStatus.SUCCEEDED,
@@ -597,6 +705,20 @@ class ControlPlane:
             kind="run.cancelled",
             data={"actor": principal.principal_id},
         )
+        if cancelled_plan is not None:
+            await self.store.append_event(
+                run_id=run_id,
+                attempt_id=current.active_attempt_id,
+                source=EventSource.CONTROL,
+                kind="plan.rejected",
+                data={
+                    "plan_id": cancelled_plan.plan_id,
+                    "plan_revision": cancelled_plan.revision,
+                    "plan_sha256": cancelled_plan.plan_sha256,
+                    "actor": principal.principal_id,
+                    "reason": "run_cancelled",
+                },
+            )
         await self._audit_run(principal, cancelled, "run.cancel", "success")
         return cancelled
 
@@ -612,6 +734,10 @@ class ControlPlane:
                 )
             if current.status not in {RunStatus.FAILED, RunStatus.CANCELLED}:
                 raise RunTransitionError("only failed or cancelled Runs can be retried")
+            if current.phase is RunPhase.WAITING_APPROVAL:
+                raise RunTransitionError(
+                    "a rejected Plan cannot be retried in place; submit a new Run to re-plan"
+                )
             queued = current.model_copy(
                 update={
                     "status": RunStatus.QUEUED,
@@ -648,9 +774,110 @@ class ControlPlane:
         run = await self._owned_run(principal, run_id)
         if run.status is not RunStatus.WAITING:
             raise RunTransitionError("only a waiting Run can be resumed")
+        if run.phase is RunPhase.WAITING_APPROVAL:
+            raise RunTransitionError(
+                "Plan-ReAct Runs continue through /approve or /reject, not /resume"
+            )
         raise RunResumeUnsupported(
             "the pinned DSH SDK has no Host session-resume method; refusing to fake a new turn"
         )
+
+    async def _decide_plan(
+        self,
+        principal: Principal,
+        run_id: str,
+        *,
+        plan_id: str,
+        plan_revision: int,
+        plan_sha256: str,
+        approved: bool,
+        comment: str | None,
+    ) -> PlanDecisionView:
+        await self._ensure_started()
+        lock = self._run_locks.setdefault(run_id, asyncio.Lock())
+        async with lock:
+            current = await self._owned_run(principal, run_id)
+            if (
+                current.status is not RunStatus.WAITING
+                or current.phase is not RunPhase.WAITING_APPROVAL
+            ):
+                raise PlanDecisionConflict("Run is not waiting for a Plan-ReAct decision")
+            plan = await self.store.get_plan(run_id)
+            if plan.status is not PlanStatus.PENDING:
+                raise PlanDecisionConflict(f"Plan is already {plan.status.value}")
+            if plan.plan_id != plan_id:
+                raise PlanDecisionConflict("plan_id does not match the pending Plan")
+            if plan.revision != plan_revision:
+                raise PlanDecisionConflict("Plan revision changed; reload it before deciding")
+            if plan.plan_sha256 != plan_sha256:
+                raise PlanDecisionConflict("plan_sha256 does not match the pending Plan")
+            if approved:
+                # Verify both the immutable template and arguments again at the
+                # approval boundary. Execution repeats the same verification.
+                try:
+                    compiled_workflow(plan)
+                except PlanCompilationError as exc:
+                    raise PlanDecisionConflict(str(exc)) from exc
+            now = utc_now()
+            decision = PlanStatus.APPROVED if approved else PlanStatus.REJECTED
+            decided_plan = plan.model_copy(
+                update={
+                    "status": decision,
+                    "revision": plan.revision + 1,
+                    "decided_by": principal.principal_id,
+                    "decision_comment": comment,
+                    "decided_at": now,
+                    "updated_at": now,
+                }
+            )
+            decided_run = current.model_copy(
+                update={
+                    "status": RunStatus.QUEUED if approved else RunStatus.CANCELLED,
+                    "phase": RunPhase.EXECUTING if approved else current.phase,
+                    "revision": current.revision + 1,
+                    "active_attempt_id": None,
+                    "error": None if approved else "Plan rejected by approver",
+                    "cancel_requested": not approved,
+                    "updated_at": now,
+                }
+            )
+            try:
+                await self.store.decide_plan(
+                    decided_run,
+                    decided_plan,
+                    expected_run_revision=current.revision,
+                    expected_plan_revision=plan.revision,
+                )
+            except StoreError as exc:
+                raise PlanDecisionConflict(str(exc)) from exc
+
+        outcome = "approved" if approved else "rejected"
+        await self.store.append_event(
+            run_id=run_id,
+            attempt_id=current.active_attempt_id,
+            source=EventSource.CONTROL,
+            kind=f"plan.{outcome}",
+            data={
+                "plan_id": decided_plan.plan_id,
+                "plan_revision": decided_plan.revision,
+                "plan_sha256": decided_plan.plan_sha256,
+                "actor": principal.principal_id,
+            },
+        )
+        await self._audit_run(
+            principal,
+            decided_run,
+            f"plan.{outcome}",
+            "success",
+            data={
+                "plan_id": decided_plan.plan_id,
+                "plan_revision": decided_plan.revision,
+                "plan_sha256": decided_plan.plan_sha256,
+            },
+        )
+        if approved and self.auto_execute:
+            await self._schedule(run_id)
+        return PlanDecisionView(run=decided_run, plan=decided_plan)
 
     async def execute_leased_work(self, lease: WorkLease) -> bool:
         """Execute at most one Run fenced to this Worker.
@@ -709,9 +936,21 @@ class ControlPlane:
         async with self._task_lock:
             existing = self._tasks.get(run_id)
             if existing is not None and not existing.done():
+                if run_id not in self._deferred_schedules:
+                    self._deferred_schedules.add(run_id)
+                    existing.add_done_callback(
+                        lambda _: asyncio.create_task(self._run_deferred_schedule(run_id))
+                    )
                 return
             task = asyncio.create_task(self._execute(run_id), name=f"run-{run_id}")
             self._tasks[run_id] = task
+
+    async def _run_deferred_schedule(self, run_id: str) -> None:
+        try:
+            if not self._closed:
+                await self._schedule(run_id)
+        finally:
+            self._deferred_schedules.discard(run_id)
 
     async def _schedule_conversation(self, conversation_id: str, run_id: str) -> None:
         self._run_done.setdefault(run_id, asyncio.Event())
@@ -854,6 +1093,7 @@ class ControlPlane:
         gateway: ToolGateway | None = None
         memory_gateway: MemoryContextGateway | None = None
         runtime: DshRuntime | None = None
+        plan_collector: PlanSubmissionCollector | None = None
         try:
             lock = self._run_locks.setdefault(run_id, asyncio.Lock())
             async with lock:
@@ -867,6 +1107,7 @@ class ControlPlane:
                     run_id=run_id,
                     number=current.attempt_count + 1,
                     dsh_session_id=f"session_{run_id}_{current.attempt_count + 1}",
+                    phase=current.phase,
                     worker_id=None if lease is None else lease.worker_id,
                     lease_token=None if lease is None else lease.lease_token,
                 )
@@ -958,11 +1199,30 @@ class ControlPlane:
                     content=content,
                 )
 
-            agent = self._agent(run.agent_id)
+            registered_agent = self._agent(run.agent_id)
+            workflow: CompiledWorkflow | None = None
+            approved_plan: PlanRecord | None = None
+            if run.phase is RunPhase.PLANNING:
+                agent, plan_collector = planning_agent(registered_agent)
+            elif run.phase is RunPhase.EXECUTING:
+                approved_plan = await self.store.get_plan(run_id)
+                if approved_plan.status is not PlanStatus.APPROVED:
+                    raise PlanCompilationError("Run execution requires an approved Plan")
+                workflow = compiled_workflow(approved_plan)
+                agent = execution_agent(registered_agent, approved_plan)
+            elif run.phase is RunPhase.DIRECT:
+                agent = registered_agent
+            else:
+                raise RunTransitionError(f"Run phase '{run.phase.value}' is not executable")
+
             if agent.tools:
                 gateway = ToolGateway(
                     agent=agent,
-                    authorizer=self.authorizer,
+                    authorizer=(
+                        PlanningAuthorizer(self.authorizer)
+                        if run.phase is RunPhase.PLANNING
+                        else self.authorizer
+                    ),
                     write_event=write_event,
                     write_audit=write_audit,
                     write_artifact=write_artifact,
@@ -1030,29 +1290,127 @@ class ControlPlane:
                 kind, data = projected
                 await write_event(EventSource.DSH, kind, data)
 
-            result = await runtime.run(
-                run.input,
-                session_id=attempt.dsh_session_id,
-                on_event=on_dsh_event,
-                on_notification=self._notification_handler(run, attempt),
-            )
-            if result.session_id != attempt.dsh_session_id:
-                raise RuntimeError("DSH returned a different Session ID")
-            if not dispatch_accepted:
-                await self._set_dispatch_state(
-                    attempt.attempt_id,
-                    DispatchState.ACCEPTED,
+            notification_handler = self._notification_handler(run, attempt)
+            if workflow is None:
+                result = await runtime.run(
+                    run.input,
+                    session_id=attempt.dsh_session_id,
+                    on_event=on_dsh_event,
+                    on_notification=notification_handler,
+                )
+                if result.session_id != attempt.dsh_session_id:
+                    raise RuntimeError("DSH returned a different Session ID")
+                if not dispatch_accepted:
+                    await self._set_dispatch_state(
+                        attempt.attempt_id,
+                        DispatchState.ACCEPTED,
+                        lease=lease,
+                    )
+                if result.finish_reason != "completed":
+                    raise RuntimeError(
+                        f"DSH Run did not complete: {result.finish_reason or 'unknown'}"
+                    )
+                if run.phase is RunPhase.PLANNING:
+                    if plan_collector is None or plan_collector.proposal is None:
+                        raise PlanCompilationError(
+                            "planning completed without exactly one submit_plan Tool call"
+                        )
+                    plan, _ = compile_plan(
+                        run=run,
+                        agent=registered_agent,
+                        proposal=plan_collector.proposal,
+                    )
+                    await self._settle_planning(
+                        run,
+                        attempt,
+                        plan,
+                        result.final_response,
+                        result.finish_reason,
+                        lease=lease,
+                    )
+                else:
+                    await self._settle_success(
+                        run,
+                        attempt,
+                        result.final_response,
+                        result.finish_reason,
+                        lease=lease,
+                    )
+            else:
+                if approved_plan is None:
+                    raise PlanCompilationError("approved Plan disappeared before execution")
+                await write_event(
+                    EventSource.CONTROL,
+                    "workflow.started",
+                    {
+                        "plan_id": approved_plan.plan_id,
+                        "plan_sha256": approved_plan.plan_sha256,
+                        "workflow_id": workflow.workflow_id,
+                        "workflow_version": workflow.workflow_version,
+                        "script_sha256": workflow.script_sha256,
+                        "args_sha256": workflow.args_sha256,
+                    },
+                )
+
+                async def on_workflow_notification(
+                    method: str,
+                    payload: dict[str, Any],
+                ) -> None:
+                    nonlocal dispatch_accepted
+                    if not dispatch_accepted:
+                        await self._set_dispatch_state(
+                            attempt.attempt_id,
+                            DispatchState.ACCEPTED,
+                            lease=lease,
+                        )
+                        dispatch_accepted = True
+                    await notification_handler(method, payload)
+
+                workflow_result = await runtime.execute_workflow(
+                    DshWorkflowRequest(
+                        workflow_id=workflow.workflow_id,
+                        workflow_version=workflow.workflow_version,
+                        script=workflow.script,
+                        script_sha256=workflow.script_sha256,
+                        args=workflow.args,
+                        args_sha256=workflow.args_sha256,
+                    ),
+                    session_id=attempt.dsh_session_id,
+                    on_notification=on_workflow_notification,
+                )
+                if workflow_result.session_id != attempt.dsh_session_id:
+                    raise RuntimeError("DSH Workflow returned a different Session ID")
+                if not dispatch_accepted:
+                    await self._set_dispatch_state(
+                        attempt.attempt_id,
+                        DispatchState.ACCEPTED,
+                        lease=lease,
+                    )
+                if workflow_result.stop_reason != "completed":
+                    detail = workflow_result.error or workflow_result.stop_reason
+                    raise RuntimeError(f"DSH Workflow did not complete: {detail}")
+                await write_event(
+                    EventSource.CONTROL,
+                    "workflow.completed",
+                    {
+                        "plan_id": approved_plan.plan_id,
+                        "workflow_run_id": workflow_result.workflow_run_id,
+                        "agents_started": workflow_result.agents_started,
+                    },
+                )
+                output = json.dumps(
+                    workflow_result.value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                await self._settle_success(
+                    run,
+                    attempt,
+                    output,
+                    workflow_result.stop_reason,
                     lease=lease,
                 )
-            if result.finish_reason != "completed":
-                raise RuntimeError(f"DSH Run did not complete: {result.finish_reason or 'unknown'}")
-            await self._settle_success(
-                run,
-                attempt,
-                result.final_response,
-                result.finish_reason,
-                lease=lease,
-            )
         except asyncio.CancelledError:
             # ``cancel`` owns the durable cancellation transition.
             raise
@@ -1399,6 +1757,79 @@ class ControlPlane:
             )
         )
 
+    async def _settle_planning(
+        self,
+        started_run: RunRecord,
+        started_attempt: RunAttempt,
+        plan: PlanRecord,
+        output: str,
+        finish_reason: str | None,
+        *,
+        lease: WorkLease | None = None,
+    ) -> None:
+        lock = self._run_locks.setdefault(started_run.run_id, asyncio.Lock())
+        async with lock:
+            current = await self.store.get_run(started_run.run_id)
+            if current.status is RunStatus.CANCELLED:
+                return
+            attempt = await self.store.get_attempt(started_attempt.attempt_id)
+            now = utc_now()
+            settled_attempt = attempt.model_copy(
+                update={
+                    "status": AttemptStatus.SUCCEEDED,
+                    "dispatch_state": DispatchState.SETTLED,
+                    "revision": attempt.revision + 1,
+                    "finish_reason": finish_reason,
+                    "output": output,
+                    "finished_at": now,
+                    "updated_at": now,
+                }
+            )
+            waiting_run = current.model_copy(
+                update={
+                    "status": RunStatus.WAITING,
+                    "phase": RunPhase.WAITING_APPROVAL,
+                    "plan_id": plan.plan_id,
+                    "revision": current.revision + 1,
+                    "output": None,
+                    "error": None,
+                    "updated_at": now,
+                }
+            )
+            await self.store.complete_planning(
+                waiting_run,
+                settled_attempt,
+                plan,
+                expected_run_revision=current.revision,
+                expected_attempt_revision=attempt.revision,
+                lease=lease,
+            )
+        await self.store.append_event(
+            run_id=waiting_run.run_id,
+            attempt_id=settled_attempt.attempt_id,
+            source=EventSource.CONTROL,
+            kind="plan.proposed",
+            data={
+                "plan_id": plan.plan_id,
+                "plan_revision": plan.revision,
+                "plan_sha256": plan.plan_sha256,
+                "step_count": len(plan.steps),
+                "requested_tools": list(plan.requested_tools),
+            },
+        )
+        await self._audit_run(
+            Principal(waiting_run.tenant_id, waiting_run.principal_id),
+            waiting_run,
+            "plan.propose",
+            "waiting_approval",
+            attempt_id=settled_attempt.attempt_id,
+            data={
+                "plan_id": plan.plan_id,
+                "plan_revision": plan.revision,
+                "plan_sha256": plan.plan_sha256,
+            },
+        )
+
     async def _settle_success(
         self,
         started_run: RunRecord,
@@ -1429,6 +1860,7 @@ class ControlPlane:
             settled_run = current.model_copy(
                 update={
                     "status": RunStatus.SUCCEEDED,
+                    "phase": RunPhase.COMPLETED,
                     "revision": current.revision + 1,
                     "output": output,
                     "error": None,
@@ -1699,6 +2131,8 @@ __all__ = [
     "AgentNotFoundError",
     "ConversationAccessDenied",
     "ControlPlane",
+    "PlanDecisionConflict",
+    "PlanDecisionView",
     "RunAccessDenied",
     "RunResumeUnsupported",
     "RunTransitionError",

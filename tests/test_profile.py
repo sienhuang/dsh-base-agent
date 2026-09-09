@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import stat
 
-from dsh_base_agent import Agent, MemorySearchRequest, memory_provider, tool
+from dsh_base_agent import Agent, MemorySearchRequest, PlanReact, memory_provider, tool
 from dsh_base_agent.adapters.dsh.profile import DshProfileCompiler
 
 
@@ -88,3 +88,30 @@ def test_profile_inserts_authenticated_memory_pre_step_plugin(tmp_path) -> None:
         "maxContextBytes": 16 * 1024,
         "timeoutMs": 10_000,
     }
+
+
+def test_profile_inserts_direct_workflow_rpc_for_plan_react(tmp_path) -> None:
+    agent = Agent(
+        name="planner",
+        prompt="Plan first.",
+        plan_react=PlanReact(),
+    )
+    (path,) = DshProfileCompiler().compile(
+        agent,
+        workspace=tmp_path / "workspace",
+        dsh_home=tmp_path,
+        attempt_id="attempt-plan",
+        tool_gateway_url=None,
+    )
+
+    patch = json.loads(path.read_text(encoding="utf-8"))
+    insertion = next(
+        row["insert"][0]
+        for row in patch
+        if "insert" in row and row["insert"][0]["id"] == "base-agent-direct-workflow-rpc"
+    )
+    assert insertion["name"].startswith("file://")
+    assert insertion["name"].endswith("direct_workflow_rpc_plugin.mjs")
+    materialized = tmp_path / "profiles" / "base-agent-plugins"
+    assert (materialized / "direct_workflow_rpc_plugin.mjs").is_file()
+    assert {"id": "tool-workflow", "disabled": True} in patch

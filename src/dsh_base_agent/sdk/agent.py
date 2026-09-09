@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass
 
 from dsh_base_agent.sdk.memory import MemoryProvider
+from dsh_base_agent.sdk.plan_react import PlanReact
 from dsh_base_agent.sdk.tools import Tool
 
 _NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -24,6 +25,7 @@ class Agent:
     version: str = "1.0.0"
     permissions: frozenset[str] = frozenset()
     memory_providers: tuple[MemoryProvider, ...] = ()
+    plan_react: PlanReact | None = None
 
     def __post_init__(self) -> None:
         if not _NAME.fullmatch(self.name):
@@ -35,6 +37,8 @@ class Agent:
         tool_names = [item.spec.name for item in self.tools]
         if len(tool_names) != len(set(tool_names)):
             raise ValueError("Agent tools must have unique names")
+        if self.plan_react is not None and "submit_plan" in tool_names:
+            raise ValueError("Plan-ReAct reserves the Tool name 'submit_plan'")
         if any(not skill.strip() for skill in self.skills):
             raise ValueError("Agent skill names must not be blank")
         if len(self.skills) != len(set(self.skills)):
@@ -72,6 +76,16 @@ class Agent:
                 for item in self.memory_providers
             ],
             "permissions": sorted(self.permissions),
+            "plan_react": (
+                None
+                if self.plan_react is None
+                else {
+                    "max_steps": self.plan_react.max_steps,
+                    "max_task_chars": self.plan_react.max_task_chars,
+                    "workflow_id": self.plan_react.workflow_id,
+                    "workflow_version": self.plan_react.workflow_version,
+                }
+            ),
             "prompt": self.prompt,
             "skills": list(self.skills),
             "tools": [

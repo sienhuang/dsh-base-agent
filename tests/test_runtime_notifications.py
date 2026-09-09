@@ -8,7 +8,10 @@ from typing import Any
 
 import pytest
 
-from dsh_base_agent.adapters.dsh.runtime import _OfficialDshRuntime
+from dsh_base_agent.adapters.dsh.runtime import (
+    DshWorkflowRequest,
+    _OfficialDshRuntime,
+)
 
 
 @dataclass
@@ -121,3 +124,79 @@ async def test_runtime_cancellation_closes_harness_to_stop_background_run() -> N
 
     assert harness.closed is True
     assert harness.stopped.is_set()
+
+
+async def test_runtime_executes_workflow_through_host_rpc_and_streams_notifications() -> None:
+    captured: dict[str, Any] = {}
+
+    class Client:
+        def request(
+            self,
+            method: str,
+            params: dict[str, Any],
+            *,
+            response_model: Any,
+            timeout_seconds: float,
+            on_notification: Any,
+        ) -> Any:
+            captured.update(
+                method=method,
+                params=params,
+                response_model=response_model,
+                timeout_seconds=timeout_seconds,
+            )
+            on_notification(Notification("workflow.started", {"id": "workflow-1"}))
+            return response_model.model_validate(
+                {
+                    "runId": "workflow-1",
+                    "stopReason": "completed",
+                    "agentsStarted": 2,
+                    "value": {"answer": 391},
+                }
+            )
+
+    class WorkflowHarness:
+        def __init__(self) -> None:
+            self.client = Client()
+            self.config = SimpleNamespace(request_timeout_seconds=123.0)
+            self.started = False
+
+        def start(self) -> None:
+            self.started = True
+
+        def close(self) -> None:
+            pass
+
+    harness = WorkflowHarness()
+    runtime = _OfficialDshRuntime(harness)
+    notifications: list[tuple[str, dict[str, Any]]] = []
+
+    async def on_notification(method: str, payload: dict[str, Any]) -> None:
+        notifications.append((method, payload))
+
+    result = await runtime.execute_workflow(
+        DshWorkflowRequest(
+            workflow_id="parallel-facts",
+            workflow_version="1.0.0",
+            script="return 391",
+            script_sha256="a" * 64,
+            args={"steps": [{"stepId": "calculate"}]},
+            args_sha256=(
+                "377c15be2ec3d963b07f4dd8872e7d979f6aaf89cc76e095c155cff5e0c45fb9"
+            ),
+        ),
+        session_id="session-workflow-1",
+        on_notification=on_notification,
+    )
+
+    assert harness.started is True
+    assert captured["method"] == "base-agent/workflow.execute"
+    assert captured["params"]["sessionId"] == "session-workflow-1"
+    assert captured["params"]["scriptSha256"] == "a" * 64
+    assert captured["params"]["argsSha256"] == (
+        "377c15be2ec3d963b07f4dd8872e7d979f6aaf89cc76e095c155cff5e0c45fb9"
+    )
+    assert captured["timeout_seconds"] == 123.0
+    assert notifications == [("workflow.started", {"id": "workflow-1"})]
+    assert result.workflow_run_id == "workflow-1"
+    assert result.value == {"answer": 391}

@@ -11,15 +11,18 @@ src/dsh_base_agent/
 ├── sdk/
 │   ├── agent.py                不可变 Agent 定义
 │   ├── memory.py               @memory_provider 和可信检索上下文
+│   ├── plan_react.py           Plan-ReAct 开关和版本配置
 │   └── tools.py                @tool、ToolContext 和 Tool 协议
 ├── control/
 │   ├── auth.py                 Principal、Authorizer 和权限请求
 │   ├── models.py               Conversation、Run、Attempt、Event、Audit
+│   ├── plan_react.py           结构化 Plan 校验与固定 Workflow 编译
 │   └── plane.py                业务状态编排；不实现模型循环
 ├── adapters/
 │   ├── dsh/
 │   │   ├── context_gateway.py  Python Memory 到 pre-step 的认证 loopback 桥
 │   │   ├── memory_context_plugin.mjs  DSH agent/pre-step 插件
+│   │   ├── direct_workflow_rpc_plugin.mjs  Host 直接启动 DSH Workflow
 │   │   ├── profile.py          Agent 定义到 DSH Profile patch
 │   │   └── runtime.py          官方 DSH Python SDK 窄适配
 │   ├── kafka/

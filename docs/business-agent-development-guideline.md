@@ -478,7 +478,8 @@ uv run pytest
 - Skill 远程安装、严格 allowlist、内容摘要和供应链版本锁定。
 - S3 Workspace/Artifact 后端、Artifact 容量配额、TTL 和孤儿扫描。
 - 模型按 chunk 继续读取完整大 Artifact。
-- 被中断原 Turn 的可靠恢复，以及完整 WAITING/Approval 流程。
+- 被中断原 Turn 的可靠恢复，以及 DSH live Turn 内的 WAITING/Approval；独立 Run 的
+  Plan-ReAct 已提供两个 Attempt 之间的持久化审批点。
 - Run/Audit/Event/Kafka 的全链路事务 Outbox；Kafka Notification 当前为 best-effort。
 - 全部入口和累计数据面的统一 Payload 限额。
 - 仅靠 SQLite 实现多副本或分布式并发。

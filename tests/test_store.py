@@ -8,11 +8,48 @@ from dsh_base_agent.control.models import (
     ConversationRecord,
     EventSource,
     RunAttempt,
+    RunPhase,
     RunRecord,
     RunStatus,
     utc_now,
 )
 from dsh_base_agent.store import IdempotencyConflictError, SqliteControlStore
+
+
+async def test_store_backfills_succeeded_run_phase(tmp_path) -> None:
+    path = tmp_path / "control.db"
+    store = SqliteControlStore(path)
+    await store.initialize()
+    run = RunRecord(
+        tenant_id="tenant-a",
+        principal_id="alice",
+        agent_id="orders",
+        agent_version="1.0.0",
+        agent_fingerprint="a" * 64,
+        input="hello",
+        phase=RunPhase.EXECUTING,
+    )
+    await store.create_run(run, idempotency_key=None, request_digest=run.run_id)
+    await store.replace_run(
+        run.model_copy(
+            update={
+                "status": RunStatus.SUCCEEDED,
+                "revision": 2,
+            }
+        ),
+        expected_revision=1,
+    )
+    await store.close()
+
+    reopened = SqliteControlStore(path)
+    await reopened.initialize()
+    try:
+        migrated = await reopened.get_run(run.run_id)
+        assert migrated.status is RunStatus.SUCCEEDED
+        assert migrated.phase is RunPhase.COMPLETED
+        assert migrated.revision == 2
+    finally:
+        await reopened.close()
 
 
 async def test_store_persists_idempotent_run_attempt_and_events(tmp_path) -> None:

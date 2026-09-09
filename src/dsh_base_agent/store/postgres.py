@@ -21,6 +21,7 @@ from dsh_base_agent.control.models import (
     ConversationStatus,
     DispatchState,
     EventSource,
+    PlanRecord,
     RunAttempt,
     RunEvent,
     RunRecord,
@@ -35,6 +36,7 @@ from dsh_base_agent.store.sqlite import (
     ConversationNotFoundError,
     IdempotencyConflictError,
     LeaseLostError,
+    PlanNotFoundError,
     RevisionConflictError,
     RunNotFoundError,
     StoreError,
@@ -473,6 +475,70 @@ class PostgresControlStore:
                 run_id,
             )
         return tuple(_model_from_payload(RunAttempt, row["payload"]) for row in rows)
+
+    async def get_plan(self, run_id: str) -> PlanRecord:
+        pool = self._require_pool()
+        async with pool.acquire() as connection:
+            row = await connection.fetchrow(
+                "SELECT payload FROM plans WHERE run_id = $1",
+                run_id,
+            )
+        if row is None:
+            raise PlanNotFoundError(f"Plan for Run '{run_id}' was not found")
+        return _model_from_payload(PlanRecord, row["payload"])
+
+    async def complete_planning(
+        self,
+        run: RunRecord,
+        attempt: RunAttempt,
+        plan: PlanRecord,
+        *,
+        expected_run_revision: int,
+        expected_attempt_revision: int,
+        lease: WorkLease | None = None,
+    ) -> None:
+        _validate_revision(run.revision, expected_run_revision, "Run")
+        _validate_revision(attempt.revision, expected_attempt_revision, "RunAttempt")
+        if plan.run_id != run.run_id or attempt.run_id != run.run_id:
+            raise ValueError("planning records must belong to the same Run")
+        pool = self._require_pool()
+        async with pool.acquire() as connection, connection.transaction():
+            if lease is not None:
+                await self._assert_lease(connection, lease)
+            attempt_updated = await self._update_attempt(
+                connection,
+                attempt,
+                expected_attempt_revision,
+            )
+            if attempt_updated is None:
+                raise RevisionConflictError(
+                    f"RunAttempt '{attempt.attempt_id}' changed concurrently"
+                )
+            run_updated = await self._update_run(connection, run, expected_run_revision)
+            if run_updated is None:
+                raise RevisionConflictError(f"Run '{run.run_id}' changed concurrently")
+            await self._insert_plan(connection, plan)
+
+    async def decide_plan(
+        self,
+        run: RunRecord,
+        plan: PlanRecord,
+        *,
+        expected_run_revision: int,
+        expected_plan_revision: int,
+    ) -> None:
+        _validate_revision(run.revision, expected_run_revision, "Run")
+        _validate_revision(plan.revision, expected_plan_revision, "Plan")
+        if plan.run_id != run.run_id:
+            raise ValueError("Plan must belong to the Run being decided")
+        pool = self._require_pool()
+        async with pool.acquire() as connection, connection.transaction():
+            plan_updated = await self._update_plan(connection, plan, expected_plan_revision)
+            if plan_updated is None:
+                raise RevisionConflictError(f"Plan '{plan.plan_id}' changed concurrently")
+            run_updated = await self._update_run(connection, run, expected_run_revision)
+            if run_updated is None:
+                raise RevisionConflictError(f"Run '{run.run_id}' changed concurrently")
 
     async def append_event(
         self,
@@ -1085,6 +1151,50 @@ class PostgresControlStore:
             attempt.updated_at,
             attempt.model_dump_json(),
         )
+
+    @staticmethod
+    async def _insert_plan(connection: _PgConnection, plan: PlanRecord) -> None:
+        await connection.execute(
+            """
+            INSERT INTO plans(
+                plan_id, run_id, status, revision, plan_sha256,
+                created_at, updated_at, payload
+            ) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
+            """,
+            plan.plan_id,
+            plan.run_id,
+            plan.status.value,
+            plan.revision,
+            plan.plan_sha256,
+            plan.created_at,
+            plan.updated_at,
+            plan.model_dump_json(),
+        )
+
+    @staticmethod
+    async def _update_plan(
+        connection: _PgConnection,
+        plan: PlanRecord,
+        expected_revision: int,
+    ) -> str | None:
+        value = await connection.fetchval(
+            """
+            UPDATE plans
+            SET status = $1, revision = $2, plan_sha256 = $3,
+                created_at = $4, updated_at = $5, payload = $6::jsonb
+            WHERE plan_id = $7 AND revision = $8
+            RETURNING plan_id
+            """,
+            plan.status.value,
+            plan.revision,
+            plan.plan_sha256,
+            plan.created_at,
+            plan.updated_at,
+            plan.model_dump_json(),
+            plan.plan_id,
+            expected_revision,
+        )
+        return None if value is None else str(value)
 
     @staticmethod
     async def _update_attempt(

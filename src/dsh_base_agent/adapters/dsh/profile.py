@@ -109,6 +109,21 @@ class DshProfileCompiler:
                     ]
                 }
             )
+        if agent.plan_react is not None:
+            workflow_rpc = _materialize_runtime_plugin(
+                Path(__file__).with_name("direct_workflow_rpc_plugin.mjs").resolve(),
+                dsh_home=dsh_home,
+            )
+            patches.append(
+                {
+                    "insert": [
+                        {
+                            "id": "base-agent-direct-workflow-rpc",
+                            "name": workflow_rpc.as_uri(),
+                        }
+                    ]
+                }
+            )
 
         patch_dir = dsh_home / "control-plane-patches"
         patch_dir.mkdir(parents=True, exist_ok=True)
@@ -138,6 +153,15 @@ def _atomic_write(path: Path, content: str) -> None:
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def _materialize_runtime_plugin(source: Path, *, dsh_home: Path) -> Path:
+    """Place a Plugin below ``profiles`` so it can resolve DSH's module proxies."""
+
+    target = dsh_home / "profiles" / "base-agent-plugins" / source.name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(target, source.read_text(encoding="utf-8"))
+    return target.resolve()
 
 
 __all__ = ["DshProfileCompiler", "ProfileCompilationError"]

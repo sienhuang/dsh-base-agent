@@ -283,7 +283,11 @@ async def test_postgres_schema_has_migration_and_first_class_relationship_column
     finally:
         await connection.close()
 
-    assert [(row["version"], row["name"]) for row in migrations] == [(1, "initial_control_store")]
+    assert [(row["version"], row["name"]) for row in migrations] == [
+        (1, "initial_control_store"),
+        (2, "plan_react"),
+        (3, "completed_run_phase"),
+    ]
     assert {row["column_name"] for row in columns} >= {
         "conversation_id",
         "sequence",

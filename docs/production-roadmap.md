@@ -26,7 +26,8 @@ Python Agent 定义
 - Run input、metadata、最终输出、Event 和 Audit 尚无统一的累计数据预算；
 - Kafka 有单消息摘要和有界条数队列，但原始对象在入队前尚无字节预算；
 - Tool Result 正文不进入 ControlStore；Event/Audit 保存哈希、大小和 Artifact 引用；
-- Skill 生命周期、公司 IAM、审批、配额和生产审计尚未实现。
+- Skill 生命周期、公司 IAM、生产审批角色策略、配额和生产审计尚未实现；独立 Run 的
+  Plan-ReAct 持久化审批已可用，但不等于 DSH live Turn 的暂停/恢复。
 
 ## 2. 目标架构
 

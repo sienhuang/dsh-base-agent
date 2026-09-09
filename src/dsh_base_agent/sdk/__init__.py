@@ -9,6 +9,7 @@ from dsh_base_agent.sdk.memory import (
     MemorySearchRequest,
     memory_provider,
 )
+from dsh_base_agent.sdk.plan_react import PlanReact
 from dsh_base_agent.sdk.tools import (
     FunctionTool,
     SideEffect,
@@ -27,6 +28,7 @@ __all__ = [
     "MemoryProvider",
     "MemoryReadiness",
     "MemorySearchRequest",
+    "PlanReact",
     "SideEffect",
     "Tool",
     "ToolContext",

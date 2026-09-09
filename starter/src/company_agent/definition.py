@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dsh_base_agent import Agent
+from dsh_base_agent import Agent, PlanReact
 
 from company_agent.context import render_static_context, static_context_sections
 from company_agent.memory import search_user_memory
@@ -29,4 +29,24 @@ def build_agent() -> Agent:
     )
 
 
-__all__ = ["build_agent"]
+def build_plan_react_agent() -> Agent:
+    """Build the approval-gated variant used by the Plan-ReAct smoke test."""
+
+    static_context = render_static_context(static_context_sections())
+    return Agent(
+        name="iris-plan-react-1",
+        version="1.0.0",
+        prompt=f"{_BASE_PROMPT.strip()}\n\n{static_context}",
+        tools=(get_request_context, query_order, generate_large_report),
+        skills=("order-support",),
+        memory_providers=(search_user_memory,),
+        permissions=frozenset({"orders:read", "context:read", "memory:read"}),
+        plan_react=PlanReact(max_steps=6),
+    )
+
+
+def build_agents() -> tuple[Agent, ...]:
+    return (build_agent(), build_plan_react_agent())
+
+
+__all__ = ["build_agent", "build_agents", "build_plan_react_agent"]

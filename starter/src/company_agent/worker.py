@@ -20,7 +20,7 @@ from dsh_base_agent import (
 )
 
 from company_agent.authorization import StarterAuthorizer
-from company_agent.definition import build_agent
+from company_agent.definition import build_agents
 
 
 def build_worker(*, project_root: str | Path | None = None) -> WorkerService:
@@ -42,7 +42,8 @@ def build_worker(*, project_root: str | Path | None = None) -> WorkerService:
         authorizer=StarterAuthorizer(),
         auto_execute=False,
     )
-    control.register(build_agent())
+    for agent in build_agents():
+        control.register(agent)
     return WorkerService(
         control,
         WorkerConfig.from_env(env_file=root / ".env"),
