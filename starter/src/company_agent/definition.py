@@ -45,8 +45,34 @@ def build_plan_react_agent() -> Agent:
     )
 
 
+def build_user_input_agent() -> Agent:
+    """Build the Conversation-only variant that can create durable questions."""
+
+    static_context = render_static_context(static_context_sections())
+    user_input_prompt = """If information required to complete the request is missing, you
+must call ask_user_question instead of asking in ordinary assistant text. Let the model decide
+the question wording and whether options are useful. After ask_user_question succeeds, end the
+Turn immediately. When the answer arrives in a later Turn, continue the original task.
+"""
+    return Agent(
+        name="iris-user-input-1",
+        version="1.0.0",
+        prompt=f"{_BASE_PROMPT.strip()}\n\n{user_input_prompt.strip()}\n\n{static_context}",
+        tools=(get_request_context, query_order, generate_large_report),
+        skills=("order-support",),
+        memory_providers=(search_user_memory,),
+        permissions=frozenset({"orders:read", "context:read", "memory:read"}),
+        allow_user_input=True,
+    )
+
+
 def build_agents() -> tuple[Agent, ...]:
-    return (build_agent(), build_plan_react_agent())
+    return (build_agent(), build_plan_react_agent(), build_user_input_agent())
 
 
-__all__ = ["build_agent", "build_agents", "build_plan_react_agent"]
+__all__ = [
+    "build_agent",
+    "build_agents",
+    "build_plan_react_agent",
+    "build_user_input_agent",
+]

@@ -24,14 +24,17 @@
 - Tool Result 超过 64 KiB 时自动写本地 Artifact，DSH 只接收有界预览和引用；
 - API 可切换开发 Header/MOA 身份认证；MOA 使用 `checktoken` 可信结果建立 Principal，Token
   不持久化且不传给 Worker；
-- FastAPI Run 查询、事件、取消、重试、resume 占位、Artifact 查询和正文下载契约；
+- FastAPI Run 查询、事件、取消、重试、RequiredAction resume、Artifact 查询和正文下载契约；
 - Conversation 创建、查询和追加 Run API；
 - 按 Conversation sequence 串行执行；存活 Worker 复用 Runtime 和 MCP Tool Gateway，替代
   Worker 使用相同持久化 DSH Home 和 Session ID 重建 Runtime；
 - `.env` Runtime 配置；
 - 启动时重新调度 `QUEUED` Run，并保守中断旧 `RUNNING` Attempt。
-- 独立 Run 的 Plan-ReAct：只读 planning、结构化 DAG、Plan/脚本/参数摘要、持久化人工审批、
-  精确 revision/hash 防误批，以及 Host JSON-RPC 直接启动 DSH Workflow；
+- 独立 Run 的 Plan-ReAct：只读 planning、结构化 DAG、Plan/脚本/参数摘要、`plan_approval`
+  RequiredAction、统一 `/resume` 决策、精确 revision/hash 防误批，以及 Host JSON-RPC 直接启动
+  DSH Workflow；
+- Conversation Run 的持久化用户输入：模型生成问题、Host MCP Tool 创建 RequiredAction、
+  Run/Attempt 等待、CAS 防重复回答，以及同 DSH Session 的新 Attempt/Turn 继续；
 
 ## 部分实现
 
@@ -56,6 +59,7 @@
 - S3 Workspace Backend、本地物化和版本提交；
 - Memory 写入、生命周期治理、质量评估和外部服务可靠消费；
 - DSH 单个 live Turn 内暂停/审批以及被中断原 Turn的完整恢复流程；
+- RequiredAction 自动过期扫描，以及通用 Tool 级副作用审批动作；
 - 分布式配额和生产 SLA。
 
 Resume 扩展的后续方向保持不变：通过公司自有 DSH 插件和版本化 JSON-RPC 扩展，把 Session

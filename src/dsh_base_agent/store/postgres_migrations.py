@@ -209,6 +209,45 @@ POSTGRES_MIGRATIONS: tuple[tuple[int, str, str], ...] = (
           AND payload->>'phase' IS DISTINCT FROM 'completed';
         """,
     ),
+    (
+        4,
+        "required_actions",
+        """
+        CREATE TABLE required_actions (
+            action_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES runs(run_id),
+            attempt_id TEXT NOT NULL REFERENCES run_attempts(attempt_id),
+            conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id),
+            tenant_id TEXT NOT NULL,
+            principal_id TEXT NOT NULL,
+            type TEXT NOT NULL CHECK (type IN ('user_input', 'plan_approval')),
+            source TEXT NOT NULL CHECK (source IN ('model', 'policy', 'tool')),
+            status TEXT NOT NULL
+                CHECK (status IN ('pending', 'answered', 'consumed', 'expired', 'cancelled')),
+            revision INTEGER NOT NULL CHECK (revision >= 1),
+            expires_at TIMESTAMPTZ,
+            answered_by TEXT,
+            answered_at TIMESTAMPTZ,
+            consumed_by_attempt_id TEXT REFERENCES run_attempts(attempt_id),
+            created_at TIMESTAMPTZ NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL,
+            payload JSONB NOT NULL
+        );
+        CREATE INDEX ix_required_actions_run_status
+            ON required_actions(run_id, status, created_at);
+        CREATE UNIQUE INDEX uq_required_actions_pending_run
+            ON required_actions(run_id)
+            WHERE status = 'pending';
+        """,
+    ),
+    (
+        5,
+        "plan_approval_required_actions",
+        """
+        ALTER TABLE required_actions
+            ALTER COLUMN conversation_id DROP NOT NULL;
+        """,
+    ),
 )
 
 

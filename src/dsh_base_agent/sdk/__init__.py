@@ -19,9 +19,17 @@ from dsh_base_agent.sdk.tools import (
     ToolSpec,
     tool,
 )
+from dsh_base_agent.sdk.user_input import (
+    AskUserQuestionRequest,
+    UserAnswer,
+    UserInputResponse,
+    UserQuestion,
+    UserQuestionOption,
+)
 
 __all__ = [
     "Agent",
+    "AskUserQuestionRequest",
     "FunctionTool",
     "FunctionMemoryProvider",
     "MemoryItem",
@@ -34,6 +42,10 @@ __all__ = [
     "ToolContext",
     "ToolReadiness",
     "ToolSpec",
+    "UserAnswer",
+    "UserInputResponse",
+    "UserQuestion",
+    "UserQuestionOption",
     "memory_provider",
     "tool",
 ]

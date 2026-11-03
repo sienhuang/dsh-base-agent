@@ -53,6 +53,31 @@ def test_profile_disables_skill_tool_when_agent_selects_no_skills(tmp_path) -> N
     assert {"id": "tool-skill", "disabled": True} in patch
 
 
+def test_profile_exposes_host_user_input_tool_and_instructions(tmp_path) -> None:
+    agent = Agent(
+        name="interactive",
+        prompt="Help the user.",
+        allow_user_input=True,
+    )
+    (path,) = DshProfileCompiler().compile(
+        agent,
+        workspace=tmp_path / "workspace",
+        dsh_home=tmp_path,
+        attempt_id="attempt-input",
+        tool_gateway_url="http://127.0.0.1:1234/mcp",
+    )
+
+    patch = json.loads(path.read_text(encoding="utf-8"))
+    persona = patch[0]["config"]["persona"]
+    assert "ask_user_question" in persona
+    insertion = next(
+        row["insert"][0]
+        for row in patch
+        if "insert" in row and row["insert"][0]["id"] == "base-agent-mcp-tools"
+    )
+    assert insertion["config"]["url"] == "http://127.0.0.1:1234/mcp"
+
+
 def test_profile_inserts_authenticated_memory_pre_step_plugin(tmp_path) -> None:
     @memory_provider
     def search_memory(request: MemorySearchRequest) -> list[dict[str, str]]:

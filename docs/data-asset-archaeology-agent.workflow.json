@@ -1,0 +1,62 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "数据资产考古与认证 Agent 工作流",
+    "locale": "zh-CN",
+    "output": "docs/data-asset-archaeology-agent.workflow.html",
+    "quality_profile": "showcase"
+  },
+  "lanes": [
+    { "id": "governance", "label": "治理平台与资产负责人" },
+    { "id": "control", "label": "dsh-base-agent 控制面" },
+    { "id": "evidence", "label": "证据、元数据与指标平台" }
+  ],
+  "phases": [
+    { "id": "discover", "label": "发现与立案", "fromCol": 0, "toCol": 1 },
+    { "id": "investigate", "label": "证据调查", "fromCol": 2, "toCol": 3, "variant": "emphasis" },
+    { "id": "certify", "label": "认证与发布", "fromCol": 4, "toCol": 4, "variant": "security" }
+  ],
+  "groups": [
+    { "id": "claim_pipeline", "label": "Evidence-backed Claims", "lane": "evidence", "fromCol": 2, "toCol": 3, "variant": "emphasis" },
+    { "id": "human_gate", "label": "Human-in-the-loop", "lane": "governance", "fromCol": 4, "toCol": 4, "variant": "security" }
+  ],
+  "mainPath": [
+    "candidate",
+    "case",
+    "collect",
+    "claims",
+    "gate",
+    "reviewer",
+    "writeback"
+  ],
+  "semanticChecks": {
+    "allowedRoots": ["candidate"],
+    "allowedTerminals": ["writeback", "manual"],
+    "requiredPaths": [
+      { "from": "candidate", "to": "writeback" },
+      { "from": "gate", "to": "reviewer" },
+      { "from": "reviewer", "to": "writeback" }
+    ]
+  },
+  "nodes": [
+    { "id": "candidate", "lane": "governance", "col": 0, "type": "messagebus", "label": "治理候选", "sublabel": "血缘缺失 · 口径缺失" },
+    { "id": "case", "lane": "control", "col": 1, "type": "backend", "label": "创建治理案例", "sublabel": "Conversation + Run" },
+    { "id": "collect", "lane": "evidence", "col": 2, "type": "cloud", "label": "采集可信证据", "sublabel": "SQL · 调度 · 日志 · BI" },
+    { "id": "claims", "lane": "evidence", "col": 3, "width": 120, "type": "backend", "label": "生成治理 Claims", "sublabel": "血缘 · 使用状态 · 指标" },
+    { "id": "gate", "lane": "control", "col": 3, "width": 124, "type": "security", "label": "证据与置信度门禁", "sublabel": "事实和推断分离" },
+    { "id": "reviewer", "lane": "governance", "col": 4, "width": 112, "type": "external", "label": "负责人补充与认证", "sublabel": "USER_QUESTION · 确认" },
+    { "id": "writeback", "lane": "evidence", "col": 4, "type": "database", "label": "写回并重评估", "sublabel": "血缘 · 指标 · 质量" },
+    { "id": "manual", "lane": "control", "col": 4, "width": 110, "type": "security", "label": "转人工治理", "sublabel": "冲突 · 无 Owner · 低置信" }
+  ],
+  "edges": [
+    { "from": "candidate", "to": "case", "label": "创建治理任务", "variant": "emphasis", "role": "main" },
+    { "from": "case", "to": "collect", "label": "按资产身份查询", "role": "main" },
+    { "from": "collect", "to": "claims", "label": "证据引用", "variant": "emphasis", "role": "main" },
+    { "from": "claims", "to": "gate", "label": "校验来源与置信度", "variant": "security", "role": "main" },
+    { "from": "gate", "to": "reviewer", "label": "提案或结构化追问", "variant": "security", "role": "main" },
+    { "from": "reviewer", "to": "writeback", "label": "精确 revision + sha256", "variant": "security", "role": "main" },
+    { "from": "gate", "to": "manual", "label": "无法安全自动处理", "variant": "security", "role": "error" },
+    { "from": "reviewer", "to": "manual", "label": "拒绝或证据冲突", "variant": "security", "role": "error" }
+  ]
+}

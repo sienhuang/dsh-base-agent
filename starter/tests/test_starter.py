@@ -24,7 +24,11 @@ from dsh_base_agent import (
 from company_agent.app import build_control, create_starter_app
 from company_agent.authorization import StarterAuthorizer
 from company_agent.context import render_static_context, static_context_sections
-from company_agent.definition import build_agent, build_plan_react_agent
+from company_agent.definition import (
+    build_agent,
+    build_plan_react_agent,
+    build_user_input_agent,
+)
 from company_agent.memory import search_user_memory
 from company_agent.tools import get_request_context, query_order
 from company_agent.worker import build_worker
@@ -62,6 +66,10 @@ def test_agent_wires_tools_skill_and_static_context() -> None:
     assert governed.plan_react is not None
     assert governed.plan_react.max_steps == 6
 
+    interactive = build_user_input_agent()
+    assert interactive.name == "iris-user-input-1"
+    assert interactive.allow_user_input is True
+
 
 def test_skill_bundle_uses_dsh_project_convention() -> None:
     starter_root = Path(__file__).resolve().parents[1]
@@ -86,7 +94,11 @@ def test_application_factory_registers_agent_and_uses_starter_workspace(tmp_path
 
     assert control.workspace == (tmp_path / "workspace").resolve()
     assert control.auto_execute is True
-    assert tuple(control.agents) == ("iris-assistant-1", "iris-plan-react-1")
+    assert tuple(control.agents) == (
+        "iris-assistant-1",
+        "iris-plan-react-1",
+        "iris-user-input-1",
+    )
     assert "/v1/runs" in {route.path for route in app.routes}
     assert "/v1/runs/{run_id}/plan" in {route.path for route in app.routes}
     assert "/v1/runs/{run_id}/approve" in {route.path for route in app.routes}

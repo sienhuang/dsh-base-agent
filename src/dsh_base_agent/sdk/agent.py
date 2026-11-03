@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from dsh_base_agent.sdk.memory import MemoryProvider
 from dsh_base_agent.sdk.plan_react import PlanReact
 from dsh_base_agent.sdk.tools import Tool
+from dsh_base_agent.sdk.user_input import ASK_USER_TOOL_NAME
 
 _NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 
@@ -26,6 +27,7 @@ class Agent:
     permissions: frozenset[str] = frozenset()
     memory_providers: tuple[MemoryProvider, ...] = ()
     plan_react: PlanReact | None = None
+    allow_user_input: bool = False
 
     def __post_init__(self) -> None:
         if not _NAME.fullmatch(self.name):
@@ -39,6 +41,12 @@ class Agent:
             raise ValueError("Agent tools must have unique names")
         if self.plan_react is not None and "submit_plan" in tool_names:
             raise ValueError("Plan-ReAct reserves the Tool name 'submit_plan'")
+        if self.plan_react is not None and self.allow_user_input:
+            raise ValueError(
+                "Plan-ReAct and durable user input cannot be enabled on the same Agent"
+            )
+        if ASK_USER_TOOL_NAME in tool_names:
+            raise ValueError(f"base-agent reserves the Tool name '{ASK_USER_TOOL_NAME}'")
         if any(not skill.strip() for skill in self.skills):
             raise ValueError("Agent skill names must not be blank")
         if len(self.skills) != len(set(self.skills)):
@@ -64,6 +72,7 @@ class Agent:
     @property
     def fingerprint(self) -> str:
         payload = {
+            "allow_user_input": self.allow_user_input,
             "name": self.name,
             "memory_providers": [
                 {

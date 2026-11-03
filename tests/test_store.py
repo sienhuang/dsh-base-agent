@@ -5,8 +5,13 @@ import sqlite3
 import pytest
 
 from dsh_base_agent.control.models import (
+    AttemptStatus,
     ConversationRecord,
     EventSource,
+    RequiredActionRecord,
+    RequiredActionSource,
+    RequiredActionStatus,
+    RequiredActionType,
     RunAttempt,
     RunPhase,
     RunRecord,
@@ -110,6 +115,174 @@ async def test_store_persists_idempotent_run_attempt_and_events(tmp_path) -> Non
     assert (first.sequence, second.sequence) == (1, 2)
     assert (await store.get_run(run.run_id)).status is RunStatus.RUNNING
     assert len(await store.list_attempts(run.run_id)) == 1
+    await store.close()
+
+
+async def test_store_persists_required_action_wait_answer_and_consume(tmp_path) -> None:
+    store = SqliteControlStore(tmp_path / "control.db")
+    await store.initialize()
+    conversation = ConversationRecord(
+        tenant_id="tenant-a",
+        principal_id="alice",
+        agent_id="orders",
+        agent_version="1.0.0",
+        agent_fingerprint="a" * 64,
+        dsh_home_key="b" * 64,
+        dsh_session_id="session-shared",
+    )
+    await store.create_conversation(conversation)
+    queued, _ = await store.create_conversation_run(
+        conversation.conversation_id,
+        RunRecord(
+            conversation_id=conversation.conversation_id,
+            tenant_id="tenant-a",
+            principal_id="alice",
+            agent_id="orders",
+            agent_version="1.0.0",
+            agent_fingerprint="a" * 64,
+            input="deploy",
+        ),
+        idempotency_key=None,
+        request_digest="request",
+    )
+    attempt = RunAttempt(
+        run_id=queued.run_id,
+        number=1,
+        dsh_session_id=conversation.dsh_session_id,
+        status=AttemptStatus.RUNNING,
+    )
+    running = queued.model_copy(
+        update={
+            "status": RunStatus.RUNNING,
+            "revision": queued.revision + 1,
+            "attempt_count": 1,
+            "active_attempt_id": attempt.attempt_id,
+        }
+    )
+    await store.begin_attempt(running, attempt, expected_run_revision=queued.revision)
+
+    action = RequiredActionRecord(
+        run_id=queued.run_id,
+        attempt_id=attempt.attempt_id,
+        conversation_id=conversation.conversation_id,
+        tenant_id="tenant-a",
+        principal_id="alice",
+        type=RequiredActionType.USER_INPUT,
+        source=RequiredActionSource.MODEL,
+        payload={
+            "questions": [
+                {
+                    "id": "environment",
+                    "question": "Choose an environment.",
+                    "options": [{"label": "dev"}, {"label": "prod"}],
+                    "multi_select": False,
+                }
+            ]
+        },
+    )
+    waiting_run, waiting_attempt = await store.enter_required_action(action)
+    assert waiting_run.status is RunStatus.WAITING
+    assert waiting_run.required_action_id == action.action_id
+    assert waiting_attempt.status is AttemptStatus.WAITING
+
+    answered = action.model_copy(
+        update={
+            "status": RequiredActionStatus.ANSWERED,
+            "response": {
+                "answers": [{"id": "environment", "selected": ["dev"]}]
+            },
+            "revision": 2,
+        }
+    )
+    resumed = waiting_run.model_copy(
+        update={
+            "status": RunStatus.QUEUED,
+            "revision": waiting_run.revision + 1,
+            "active_attempt_id": None,
+        }
+    )
+    await store.answer_required_action(
+        resumed,
+        answered,
+        expected_run_revision=waiting_run.revision,
+        expected_action_revision=action.revision,
+    )
+
+    second_attempt = RunAttempt(
+        run_id=queued.run_id,
+        number=2,
+        dsh_session_id=conversation.dsh_session_id,
+        status=AttemptStatus.RUNNING,
+    )
+    consumed = answered.model_copy(
+        update={
+            "status": RequiredActionStatus.CONSUMED,
+            "revision": answered.revision + 1,
+            "consumed_by_attempt_id": second_attempt.attempt_id,
+        }
+    )
+    running_again = resumed.model_copy(
+        update={
+            "status": RunStatus.RUNNING,
+            "revision": resumed.revision + 1,
+            "attempt_count": 2,
+            "active_attempt_id": second_attempt.attempt_id,
+            "required_action_id": None,
+        }
+    )
+    await store.begin_attempt(
+        running_again,
+        second_attempt,
+        expected_run_revision=resumed.revision,
+        consumed_action=consumed,
+        expected_action_revision=answered.revision,
+    )
+
+    assert (await store.get_required_action(action.action_id)).status is (
+        RequiredActionStatus.CONSUMED
+    )
+    assert (await store.get_run(queued.run_id)).required_action_id is None
+    assert len(await store.list_attempts(queued.run_id)) == 2
+
+    second_action = action.model_copy(
+        update={
+            "action_id": "action-second",
+            "attempt_id": second_attempt.attempt_id,
+            "status": RequiredActionStatus.PENDING,
+            "response": None,
+            "revision": 1,
+            "answered_by": None,
+            "answered_at": None,
+            "consumed_by_attempt_id": None,
+        }
+    )
+    waiting_again, waiting_second_attempt = await store.enter_required_action(second_action)
+    cancelled_action = second_action.model_copy(
+        update={"status": RequiredActionStatus.CANCELLED, "revision": 2}
+    )
+    cancelled_attempt = waiting_second_attempt.model_copy(
+        update={"status": AttemptStatus.CANCELLED, "revision": waiting_second_attempt.revision + 1}
+    )
+    cancelled_run = waiting_again.model_copy(
+        update={
+            "status": RunStatus.CANCELLED,
+            "revision": waiting_again.revision + 1,
+            "active_attempt_id": None,
+            "required_action_id": None,
+        }
+    )
+    await store.settle_attempt(
+        cancelled_run,
+        cancelled_attempt,
+        expected_run_revision=waiting_again.revision,
+        expected_attempt_revision=waiting_second_attempt.revision,
+        settled_action=cancelled_action,
+        expected_action_revision=second_action.revision,
+    )
+    assert (await store.get_required_action(second_action.action_id)).status is (
+        RequiredActionStatus.CANCELLED
+    )
+    assert (await store.get_run(queued.run_id)).status is RunStatus.CANCELLED
     await store.close()
 
 

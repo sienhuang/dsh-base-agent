@@ -12,15 +12,22 @@ from typing import Any, Protocol
 
 from dsh_base_agent.control.models import (
     ArtifactRecord,
+    AttemptStatus,
     AuditRecord,
     ConversationRecord,
     ConversationStatus,
+    DispatchState,
     EventSource,
     PlanRecord,
+    RequiredActionRecord,
+    RequiredActionStatus,
+    RequiredActionType,
     RunAttempt,
     RunEvent,
     RunRecord,
+    RunStatus,
     WorkLease,
+    utc_now,
 )
 
 
@@ -53,6 +60,10 @@ class LeaseLostError(StoreError):
 
 
 class PlanNotFoundError(StoreError):
+    pass
+
+
+class RequiredActionNotFoundError(StoreError):
     pass
 
 
@@ -108,6 +119,8 @@ class ControlStore(Protocol):
         *,
         expected_run_revision: int,
         lease: WorkLease | None = None,
+        consumed_action: RequiredActionRecord | None = None,
+        expected_action_revision: int | None = None,
     ) -> None: ...
 
     async def get_attempt(self, attempt_id: str) -> RunAttempt: ...
@@ -128,9 +141,29 @@ class ControlStore(Protocol):
         expected_run_revision: int,
         expected_attempt_revision: int,
         lease: WorkLease | None = None,
+        settled_action: RequiredActionRecord | None = None,
+        expected_action_revision: int | None = None,
     ) -> None: ...
 
     async def list_attempts(self, run_id: str) -> tuple[RunAttempt, ...]: ...
+
+    async def get_required_action(self, action_id: str) -> RequiredActionRecord: ...
+
+    async def enter_required_action(
+        self,
+        action: RequiredActionRecord,
+        *,
+        lease: WorkLease | None = None,
+    ) -> tuple[RunRecord, RunAttempt]: ...
+
+    async def answer_required_action(
+        self,
+        run: RunRecord,
+        action: RequiredActionRecord,
+        *,
+        expected_run_revision: int,
+        expected_action_revision: int,
+    ) -> None: ...
 
     async def get_plan(self, run_id: str) -> PlanRecord: ...
 
@@ -139,6 +172,7 @@ class ControlStore(Protocol):
         run: RunRecord,
         attempt: RunAttempt,
         plan: PlanRecord,
+        action: RequiredActionRecord,
         *,
         expected_run_revision: int,
         expected_attempt_revision: int,
@@ -149,9 +183,11 @@ class ControlStore(Protocol):
         self,
         run: RunRecord,
         plan: PlanRecord,
+        action: RequiredActionRecord,
         *,
         expected_run_revision: int,
         expected_plan_revision: int,
+        expected_action_revision: int,
     ) -> None: ...
 
     async def append_event(
@@ -350,6 +386,17 @@ class SqliteControlStore:
                         existing = self._get_run_sync(connection, str(prior["run_id"]))
                         connection.commit()
                         return existing, False
+                waiting_rows = connection.execute(
+                    "SELECT payload FROM runs WHERE status = 'waiting'"
+                ).fetchall()
+                if any(
+                    RunRecord.model_validate_json(row["payload"]).conversation_id
+                    == conversation_id
+                    for row in waiting_rows
+                ):
+                    raise StoreError(
+                        f"Conversation '{conversation_id}' has a pending required action"
+                    )
                 persisted = run.model_copy(
                     update={
                         "conversation_id": conversation_id,
@@ -529,11 +576,19 @@ class SqliteControlStore:
         *,
         expected_run_revision: int,
         lease: WorkLease | None = None,
+        consumed_action: RequiredActionRecord | None = None,
+        expected_action_revision: int | None = None,
     ) -> None:
         if lease is not None:
             raise StoreError("distributed Worker fencing requires PostgreSQL")
         if run.revision != expected_run_revision + 1:
             raise ValueError("replacement Run revision must increment by one")
+        if (consumed_action is None) != (expected_action_revision is None):
+            raise ValueError("consumed Action and expected revision must be supplied together")
+        if consumed_action is not None:
+            assert expected_action_revision is not None
+            if consumed_action.revision != expected_action_revision + 1:
+                raise ValueError("replacement RequiredAction revision must increment by one")
         async with self._lock:
             connection = self._require_connection()
             connection.execute("BEGIN IMMEDIATE")
@@ -569,6 +624,25 @@ class SqliteControlStore:
                         attempt.model_dump_json(),
                     ),
                 )
+                if consumed_action is not None:
+                    action_result = connection.execute(
+                        """
+                        UPDATE required_actions
+                        SET status = ?, revision = ?, payload = ?
+                        WHERE action_id = ? AND revision = ? AND status = 'answered'
+                        """,
+                        (
+                            consumed_action.status.value,
+                            consumed_action.revision,
+                            consumed_action.model_dump_json(),
+                            consumed_action.action_id,
+                            expected_action_revision,
+                        ),
+                    )
+                    if action_result.rowcount != 1:
+                        raise RevisionConflictError(
+                            f"RequiredAction '{consumed_action.action_id}' changed concurrently"
+                        )
                 connection.commit()
             except BaseException:
                 connection.rollback()
@@ -629,6 +703,8 @@ class SqliteControlStore:
         expected_run_revision: int,
         expected_attempt_revision: int,
         lease: WorkLease | None = None,
+        settled_action: RequiredActionRecord | None = None,
+        expected_action_revision: int | None = None,
     ) -> None:
         if lease is not None:
             raise StoreError("distributed Worker fencing requires PostgreSQL")
@@ -636,6 +712,12 @@ class SqliteControlStore:
             raise ValueError("replacement Run revision must increment by one")
         if attempt.revision != expected_attempt_revision + 1:
             raise ValueError("replacement RunAttempt revision must increment by one")
+        if (settled_action is None) != (expected_action_revision is None):
+            raise ValueError("settled Action and expected revision must be supplied together")
+        if settled_action is not None:
+            assert expected_action_revision is not None
+            if settled_action.revision != expected_action_revision + 1:
+                raise ValueError("replacement RequiredAction revision must increment by one")
         async with self._lock:
             connection = self._require_connection()
             connection.execute("BEGIN IMMEDIATE")
@@ -672,6 +754,24 @@ class SqliteControlStore:
                 )
                 if run_result.rowcount != 1:
                     raise RevisionConflictError(f"Run '{run.run_id}' changed concurrently")
+                if settled_action is not None:
+                    action_result = connection.execute(
+                        """
+                        UPDATE required_actions SET status = ?, revision = ?, payload = ?
+                        WHERE action_id = ? AND revision = ? AND status = 'pending'
+                        """,
+                        (
+                            settled_action.status.value,
+                            settled_action.revision,
+                            settled_action.model_dump_json(),
+                            settled_action.action_id,
+                            expected_action_revision,
+                        ),
+                    )
+                    if action_result.rowcount != 1:
+                        raise RevisionConflictError(
+                            f"RequiredAction '{settled_action.action_id}' changed concurrently"
+                        )
                 connection.commit()
             except BaseException:
                 connection.rollback()
@@ -689,6 +789,126 @@ class SqliteControlStore:
             )
             return tuple(RunAttempt.model_validate_json(row["payload"]) for row in rows)
 
+    async def get_required_action(self, action_id: str) -> RequiredActionRecord:
+        async with self._lock:
+            row = (
+                self._require_connection()
+                .execute(
+                    "SELECT payload FROM required_actions WHERE action_id = ?",
+                    (action_id,),
+                )
+                .fetchone()
+            )
+            if row is None:
+                raise RequiredActionNotFoundError(
+                    f"RequiredAction '{action_id}' was not found"
+                )
+            return RequiredActionRecord.model_validate_json(row["payload"])
+
+    async def enter_required_action(
+        self,
+        action: RequiredActionRecord,
+        *,
+        lease: WorkLease | None = None,
+    ) -> tuple[RunRecord, RunAttempt]:
+        if lease is not None:
+            raise StoreError("distributed Worker fencing requires PostgreSQL")
+        if action.status is not RequiredActionStatus.PENDING:
+            raise ValueError("new RequiredAction must be pending")
+        async with self._lock:
+            connection = self._require_connection()
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                run = self._get_run_sync(connection, action.run_id)
+                attempt = self._get_attempt_sync(connection, action.attempt_id)
+                if (
+                    run.status is not RunStatus.RUNNING
+                    or run.active_attempt_id != attempt.attempt_id
+                ):
+                    raise RevisionConflictError("Run is no longer executing this Attempt")
+                if attempt.status is not AttemptStatus.RUNNING:
+                    raise RevisionConflictError("RunAttempt is no longer running")
+                if run.conversation_id != action.conversation_id:
+                    raise ValueError("RequiredAction does not belong to the Run Conversation")
+                now = utc_now()
+                waiting_run = run.model_copy(
+                    update={
+                        "status": RunStatus.WAITING,
+                        "required_action_id": action.action_id,
+                        "revision": run.revision + 1,
+                        "updated_at": now,
+                    }
+                )
+                waiting_attempt = attempt.model_copy(
+                    update={
+                        "status": AttemptStatus.WAITING,
+                        "dispatch_state": DispatchState.SETTLED,
+                        "finish_reason": "user_input_required",
+                        "revision": attempt.revision + 1,
+                        "finished_at": now,
+                        "updated_at": now,
+                    }
+                )
+                connection.execute(
+                    """
+                    INSERT INTO required_actions(action_id, run_id, status, revision, payload)
+                    VALUES(?,?,?,?,?)
+                    """,
+                    (
+                        action.action_id,
+                        action.run_id,
+                        action.status.value,
+                        action.revision,
+                        action.model_dump_json(),
+                    ),
+                )
+                self._update_run_sync(connection, waiting_run, run.revision)
+                self._update_attempt_sync(connection, waiting_attempt, attempt.revision)
+                connection.commit()
+                return waiting_run, waiting_attempt
+            except BaseException:
+                connection.rollback()
+                raise
+
+    async def answer_required_action(
+        self,
+        run: RunRecord,
+        action: RequiredActionRecord,
+        *,
+        expected_run_revision: int,
+        expected_action_revision: int,
+    ) -> None:
+        if run.revision != expected_run_revision + 1:
+            raise ValueError("replacement Run revision must increment by one")
+        if action.revision != expected_action_revision + 1:
+            raise ValueError("replacement RequiredAction revision must increment by one")
+        async with self._lock:
+            connection = self._require_connection()
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                action_result = connection.execute(
+                    """
+                    UPDATE required_actions SET status = ?, revision = ?, payload = ?
+                    WHERE action_id = ? AND revision = ? AND status = 'pending'
+                    """,
+                    (
+                        action.status.value,
+                        action.revision,
+                        action.model_dump_json(),
+                        action.action_id,
+                        expected_action_revision,
+                    ),
+                )
+                if action_result.rowcount != 1:
+                    raise RevisionConflictError(
+                        f"RequiredAction '{action.action_id}' changed concurrently"
+                    )
+                self._update_run_sync(connection, run, expected_run_revision)
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
     async def get_plan(self, run_id: str) -> PlanRecord:
         async with self._lock:
             row = (
@@ -705,6 +925,7 @@ class SqliteControlStore:
         run: RunRecord,
         attempt: RunAttempt,
         plan: PlanRecord,
+        action: RequiredActionRecord,
         *,
         expected_run_revision: int,
         expected_attempt_revision: int,
@@ -716,8 +937,19 @@ class SqliteControlStore:
             raise ValueError("replacement Run revision must increment by one")
         if attempt.revision != expected_attempt_revision + 1:
             raise ValueError("replacement RunAttempt revision must increment by one")
-        if plan.run_id != run.run_id or attempt.run_id != run.run_id:
+        if (
+            plan.run_id != run.run_id
+            or attempt.run_id != run.run_id
+            or action.run_id != run.run_id
+            or action.attempt_id != attempt.attempt_id
+        ):
             raise ValueError("planning records must belong to the same Run")
+        if action.type is not RequiredActionType.PLAN_APPROVAL:
+            raise ValueError("planning must create a plan_approval RequiredAction")
+        if action.status is not RequiredActionStatus.PENDING:
+            raise ValueError("new Plan RequiredAction must be pending")
+        if run.required_action_id != action.action_id:
+            raise ValueError("waiting Run must point to its Plan RequiredAction")
         async with self._lock:
             connection = self._require_connection()
             connection.execute("BEGIN IMMEDIATE")
@@ -767,6 +999,19 @@ class SqliteControlStore:
                         plan.model_dump_json(),
                     ),
                 )
+                connection.execute(
+                    """
+                    INSERT INTO required_actions(action_id, run_id, status, revision, payload)
+                    VALUES(?,?,?,?,?)
+                    """,
+                    (
+                        action.action_id,
+                        action.run_id,
+                        action.status.value,
+                        action.revision,
+                        action.model_dump_json(),
+                    ),
+                )
                 connection.commit()
             except BaseException:
                 connection.rollback()
@@ -776,16 +1021,22 @@ class SqliteControlStore:
         self,
         run: RunRecord,
         plan: PlanRecord,
+        action: RequiredActionRecord,
         *,
         expected_run_revision: int,
         expected_plan_revision: int,
+        expected_action_revision: int,
     ) -> None:
         if run.revision != expected_run_revision + 1:
             raise ValueError("replacement Run revision must increment by one")
         if plan.revision != expected_plan_revision + 1:
             raise ValueError("replacement Plan revision must increment by one")
-        if plan.run_id != run.run_id:
-            raise ValueError("Plan must belong to the Run being decided")
+        if action.revision != expected_action_revision + 1:
+            raise ValueError("replacement RequiredAction revision must increment by one")
+        if plan.run_id != run.run_id or action.run_id != run.run_id:
+            raise ValueError("Plan and RequiredAction must belong to the Run being decided")
+        if action.type is not RequiredActionType.PLAN_APPROVAL:
+            raise ValueError("Plan decision requires a plan_approval RequiredAction")
         async with self._lock:
             connection = self._require_connection()
             connection.execute("BEGIN IMMEDIATE")
@@ -820,6 +1071,23 @@ class SqliteControlStore:
                 )
                 if run_result.rowcount != 1:
                     raise RevisionConflictError(f"Run '{run.run_id}' changed concurrently")
+                action_result = connection.execute(
+                    """
+                    UPDATE required_actions SET status = ?, revision = ?, payload = ?
+                    WHERE action_id = ? AND revision = ? AND status = 'pending'
+                    """,
+                    (
+                        action.status.value,
+                        action.revision,
+                        action.model_dump_json(),
+                        action.action_id,
+                        expected_action_revision,
+                    ),
+                )
+                if action_result.rowcount != 1:
+                    raise RevisionConflictError(
+                        f"RequiredAction '{action.action_id}' changed concurrently"
+                    )
                 connection.commit()
             except BaseException:
                 connection.rollback()
@@ -1006,6 +1274,63 @@ class SqliteControlStore:
             raise ConversationNotFoundError(f"Conversation '{conversation_id}' was not found")
         return ConversationRecord.model_validate_json(row["payload"])
 
+    @staticmethod
+    def _get_attempt_sync(connection: sqlite3.Connection, attempt_id: str) -> RunAttempt:
+        row = connection.execute(
+            "SELECT payload FROM run_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        if row is None:
+            raise AttemptNotFoundError(f"RunAttempt '{attempt_id}' was not found")
+        return RunAttempt.model_validate_json(row["payload"])
+
+    @staticmethod
+    def _update_run_sync(
+        connection: sqlite3.Connection,
+        run: RunRecord,
+        expected_revision: int,
+    ) -> None:
+        result = connection.execute(
+            """
+            UPDATE runs SET tenant_id = ?, status = ?, revision = ?, payload = ?
+            WHERE run_id = ? AND revision = ?
+            """,
+            (
+                run.tenant_id,
+                run.status.value,
+                run.revision,
+                run.model_dump_json(),
+                run.run_id,
+                expected_revision,
+            ),
+        )
+        if result.rowcount != 1:
+            raise RevisionConflictError(f"Run '{run.run_id}' changed concurrently")
+
+    @staticmethod
+    def _update_attempt_sync(
+        connection: sqlite3.Connection,
+        attempt: RunAttempt,
+        expected_revision: int,
+    ) -> None:
+        result = connection.execute(
+            """
+            UPDATE run_attempts SET status = ?, revision = ?, payload = ?
+            WHERE attempt_id = ? AND revision = ?
+            """,
+            (
+                attempt.status.value,
+                attempt.revision,
+                attempt.model_dump_json(),
+                attempt.attempt_id,
+                expected_revision,
+            ),
+        )
+        if result.rowcount != 1:
+            raise RevisionConflictError(
+                f"RunAttempt '{attempt.attempt_id}' changed concurrently"
+            )
+
 
 def request_digest(value: dict[str, Any]) -> str:
     canonical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -1090,6 +1415,18 @@ CREATE TABLE IF NOT EXISTS artifacts (
     attempt_id TEXT NOT NULL REFERENCES run_attempts(attempt_id),
     payload TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS required_actions (
+    action_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(run_id),
+    status TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_required_actions_run
+ON required_actions(run_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_required_actions_pending_run
+ON required_actions(run_id) WHERE status = 'pending';
 """
 
 
@@ -1165,6 +1502,7 @@ __all__ = [
     "IdempotencyConflictError",
     "LeaseLostError",
     "PlanNotFoundError",
+    "RequiredActionNotFoundError",
     "RevisionConflictError",
     "RunNotFoundError",
     "SqliteControlStore",

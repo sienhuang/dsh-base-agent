@@ -6,7 +6,13 @@ from typing import Any
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-from dsh_base_agent import Agent, Principal, ReadOnlyByDefaultAuthorizer, tool
+from dsh_base_agent import (
+    Agent,
+    Principal,
+    ReadOnlyByDefaultAuthorizer,
+    UserQuestion,
+    tool,
+)
 from dsh_base_agent.adapters.mcp.gateway import (
     GatewayRunContext,
     ToolGateway,
@@ -119,6 +125,90 @@ async def test_loopback_gateway_discovers_and_invokes_python_tool() -> None:
         ("tool.authorize", "allowed"),
         ("tool.execute", "success"),
     ]
+
+
+async def test_gateway_exposes_durable_ask_user_tool_and_stops_later_tools() -> None:
+    @tool
+    def greet(name: str) -> dict[str, str]:
+        return {"message": f"Hello, {name}!"}
+
+    events: list[tuple[EventSource, str, dict[str, Any]]] = []
+    questions: list[tuple[UserQuestion, ...]] = []
+
+    async def write_event(
+        source: EventSource,
+        kind: str,
+        data: dict[str, Any],
+    ) -> None:
+        events.append((source, kind, data))
+
+    async def write_audit(
+        tool_name: str,
+        action: str,
+        outcome: str,
+        data: dict[str, Any],
+    ) -> None:
+        del tool_name, action, outcome, data
+
+    async def request_user_input(request) -> str:  # type: ignore[no-untyped-def]
+        questions.append(request.questions)
+        return "action-1"
+
+    gateway = ToolGateway(
+        agent=Agent(
+            name="interactive",
+            prompt="Ask when needed.",
+            tools=(greet,),
+            allow_user_input=True,
+        ),
+        authorizer=ReadOnlyByDefaultAuthorizer(),
+        write_event=write_event,
+        write_audit=write_audit,
+    )
+    await gateway.start()
+    gateway.bind(
+        GatewayRunContext(
+            principal=Principal("tenant-a", "alice"),
+            run_id="run-1",
+            attempt_id="attempt-1",
+        ),
+        request_user_input=request_user_input,
+    )
+    try:
+        async with streamable_http_client(gateway.url) as (read_stream, write_stream, _):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                listed = await session.list_tools()
+                assert [item.name for item in listed.tools] == [
+                    "greet",
+                    "ask_user_question",
+                ]
+                result = await session.call_tool(
+                    "ask_user_question",
+                    {
+                        "questions": [
+                            {
+                                "id": "shipping_method",
+                                "question": "Choose shipping.",
+                                "options": [{"label": "Standard"}, {"label": "Express"}],
+                            }
+                        ]
+                    },
+                )
+                assert result.isError is False
+                assert result.structuredContent == {
+                    "status": "waiting_for_user_input",
+                    "action_id": "action-1",
+                    "message": "The request is durable. End this turn and wait for the user.",
+                }
+                denied = await session.call_tool("greet", {"name": "Ada"})
+                assert denied.isError is True
+    finally:
+        gateway.release("attempt-1")
+        await gateway.close()
+
+    assert questions[0][0].id == "shipping_method"
+    assert [item[1] for item in events] == ["tool.started", "tool.completed"]
 
 
 async def test_gateway_externalizes_large_tool_result_as_bounded_artifact_reference() -> None:

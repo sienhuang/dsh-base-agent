@@ -12,7 +12,12 @@ from uuid import uuid4
 
 from dotenv import dotenv_values
 
-from dsh_base_agent.control.models import ConversationStatus, WorkLease, WorkResourceType
+from dsh_base_agent.control.models import (
+    ConversationStatus,
+    RunStatus,
+    WorkLease,
+    WorkResourceType,
+)
 from dsh_base_agent.control.plane import ControlPlane
 
 _LOGGER = logging.getLogger(__name__)
@@ -237,6 +242,9 @@ class WorkerService:
                 executed = await self._execute_with_timeout(lease)
             if executed:
                 idle_since = loop.time()
+                runs = await self.control.store.list_conversation_runs(lease.resource_id)
+                if any(run.status is RunStatus.WAITING for run in runs):
+                    return
             elif loop.time() - idle_since >= self.config.conversation_idle_seconds:
                 return
             await self._wait_for_poll()

@@ -32,9 +32,8 @@ def wait_for(run_id: str, statuses: set[str], timeout_seconds: float = 300) -> d
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         view = request("GET", f"/v1/runs/{run_id}")
-        run = view["run"]
-        if run["status"] in statuses:
-            return run
+        if view["run"]["status"] in statuses:
+            return view
         time.sleep(1)
     raise TimeoutError(f"Run {run_id} did not reach {sorted(statuses)}")
 
@@ -52,25 +51,34 @@ def main() -> None:
     run_id = submitted["run_id"]
     print(f"submitted: {run_id}")
 
-    waiting = wait_for(run_id, {"waiting", "failed", "cancelled"})
+    waiting_view = wait_for(run_id, {"waiting", "failed", "cancelled"})
+    waiting = waiting_view["run"]
     if waiting["status"] != "waiting":
         raise RuntimeError(json.dumps(waiting, ensure_ascii=False, indent=2))
 
     plan = request("GET", f"/v1/runs/{run_id}/plan")
     print("proposed plan:")
     print(json.dumps(plan, ensure_ascii=False, indent=2))
+    action = waiting_view["required_action"]
+    if action is None or action["type"] != "plan_approval":
+        raise RuntimeError("waiting Plan-ReAct Run has no plan_approval RequiredAction")
 
     request(
         "POST",
-        f"/v1/runs/{run_id}/approve",
+        f"/v1/runs/{run_id}/resume",
         {
-            "plan_id": plan["plan_id"],
-            "plan_revision": plan["revision"],
-            "plan_sha256": plan["plan_sha256"],
-            "comment": "starter smoke test approval",
+            "action_id": action["action_id"],
+            "expected_revision": waiting["revision"],
+            "response": {
+                "decision": "approve",
+                "plan_id": plan["plan_id"],
+                "plan_revision": plan["revision"],
+                "plan_sha256": plan["plan_sha256"],
+                "comment": "starter smoke test approval",
+            },
         },
     )
-    finished = wait_for(run_id, {"succeeded", "failed", "cancelled"})
+    finished = wait_for(run_id, {"succeeded", "failed", "cancelled"})["run"]
     print("final run:")
     print(json.dumps(finished, ensure_ascii=False, indent=2))
     if finished["status"] != "succeeded":

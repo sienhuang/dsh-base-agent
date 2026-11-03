@@ -8,6 +8,7 @@ import json
 import logging
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -44,8 +45,14 @@ from dsh_base_agent.control.models import (
     ConversationStatus,
     DispatchState,
     EventSource,
+    PlanApprovalDecision,
+    PlanApprovalResponse,
     PlanRecord,
     PlanStatus,
+    RequiredActionRecord,
+    RequiredActionSource,
+    RequiredActionStatus,
+    RequiredActionType,
     RunAttempt,
     RunEvent,
     RunPhase,
@@ -67,11 +74,16 @@ from dsh_base_agent.control.plan_react import (
     planning_agent,
 )
 from dsh_base_agent.sdk.agent import Agent
+from dsh_base_agent.sdk.user_input import (
+    AskUserQuestionRequest,
+    validate_user_input_response,
+)
 from dsh_base_agent.store import (
     ControlStore,
     ControlStoreConfig,
     LeaseLostError,
     PostgresControlStore,
+    RequiredActionNotFoundError,
     StoreError,
     request_digest,
 )
@@ -107,6 +119,7 @@ class PlanDecisionConflict(RunTransitionError):
 class RunView:
     run: RunRecord
     attempts: tuple[RunAttempt, ...]
+    required_action: RequiredActionRecord | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,9 +153,13 @@ class ControlPlane:
         authorizer: Authorizer | None = None,
         notification_publisher: NotificationPublisher | None = None,
         auto_execute: bool = True,
+        user_input_timeout_seconds: float = 86_400.0,
     ) -> None:
+        if user_input_timeout_seconds <= 0:
+            raise ValueError("user_input_timeout_seconds must be positive")
         self.workspace = Path(workspace).expanduser().resolve()
         self.runtime_config = runtime
+        self.user_input_timeout_seconds = user_input_timeout_seconds
         if store is not None and store_config is not None:
             raise ValueError("store and store_config cannot both be provided")
         self.store = store or (store_config or ControlStoreConfig()).create(
@@ -435,6 +452,10 @@ class ControlPlane:
     ) -> RunRecord:
         await self._ensure_started()
         agent = self._agent(agent_id)
+        if agent.allow_user_input:
+            raise RunTransitionError(
+                "Agents with user input enabled must run inside a Conversation"
+            )
         if not input.strip():
             raise ValueError("Run input must not be blank")
         try:
@@ -520,7 +541,16 @@ class ControlPlane:
     async def view(self, principal: Principal, run_id: str) -> RunView:
         await self._ensure_started()
         run = await self._owned_run(principal, run_id)
-        return RunView(run=run, attempts=await self.store.list_attempts(run_id))
+        action: RequiredActionRecord | None = None
+        if run.required_action_id is not None:
+            candidate = await self.store.get_required_action(run.required_action_id)
+            if candidate.status is RequiredActionStatus.PENDING:
+                action = candidate
+        return RunView(
+            run=run,
+            attempts=await self.store.list_attempts(run_id),
+            required_action=action,
+        )
 
     async def get_plan(self, principal: Principal, run_id: str) -> PlanRecord:
         """Return the immutable proposal and its current approval decision."""
@@ -541,14 +571,16 @@ class ControlPlane:
     ) -> PlanDecisionView:
         """Approve exactly the proposal the caller inspected, then queue execution."""
 
-        return await self._decide_plan(
+        return await self._resolve_plan_action(
             principal,
             run_id,
-            plan_id=plan_id,
-            plan_revision=plan_revision,
-            plan_sha256=plan_sha256,
-            approved=True,
-            comment=comment,
+            response=PlanApprovalResponse(
+                decision=PlanApprovalDecision.APPROVE,
+                plan_id=plan_id,
+                plan_revision=plan_revision,
+                plan_sha256=plan_sha256,
+                comment=comment,
+            ),
         )
 
     async def reject_plan(
@@ -563,14 +595,16 @@ class ControlPlane:
     ) -> PlanDecisionView:
         """Reject exactly the proposal the caller inspected and cancel the Run."""
 
-        return await self._decide_plan(
+        return await self._resolve_plan_action(
             principal,
             run_id,
-            plan_id=plan_id,
-            plan_revision=plan_revision,
-            plan_sha256=plan_sha256,
-            approved=False,
-            comment=comment,
+            response=PlanApprovalResponse(
+                decision=PlanApprovalDecision.REJECT,
+                plan_id=plan_id,
+                plan_revision=plan_revision,
+                plan_sha256=plan_sha256,
+                comment=comment,
+            ),
         )
 
     async def events(
@@ -613,20 +647,38 @@ class ControlPlane:
     async def cancel(self, principal: Principal, run_id: str) -> RunRecord:
         await self._ensure_started()
         cancelled_plan: PlanRecord | None = None
+        cancelled_action: RequiredActionRecord | None = None
+        was_waiting_for_action = False
         lock = self._run_locks.setdefault(run_id, asyncio.Lock())
         async with lock:
             current = await self._owned_run(principal, run_id)
             if current.status in TERMINAL_RUN_STATUSES:
                 return current
             now = utc_now()
+            if current.required_action_id is not None:
+                action = await self.store.get_required_action(current.required_action_id)
+                if action.status is not RequiredActionStatus.PENDING:
+                    raise RunTransitionError(
+                        "Run points to a RequiredAction that is no longer pending"
+                    )
+                was_waiting_for_action = True
+                cancelled_action = action.model_copy(
+                    update={
+                        "status": RequiredActionStatus.CANCELLED,
+                        "revision": action.revision + 1,
+                        "updated_at": now,
+                    }
+                )
             cancelled = current.model_copy(
                 update={
                     "status": RunStatus.CANCELLED,
                     "active_attempt_id": (
                         None
                         if current.phase is RunPhase.WAITING_APPROVAL
+                        or was_waiting_for_action
                         else current.active_attempt_id
                     ),
+                    "required_action_id": None,
                     "cancel_requested": True,
                     "revision": current.revision + 1,
                     "error": "Run cancellation requested",
@@ -634,6 +686,10 @@ class ControlPlane:
                 }
             )
             if current.phase is RunPhase.WAITING_APPROVAL:
+                if cancelled_action is None:
+                    raise RunTransitionError(
+                        "Plan-ReAct Run has no pending Plan RequiredAction"
+                    )
                 plan = await self.store.get_plan(run_id)
                 cancelled_plan = plan.model_copy(
                     update={
@@ -648,8 +704,10 @@ class ControlPlane:
                 await self.store.decide_plan(
                     cancelled,
                     cancelled_plan,
+                    cancelled_action,
                     expected_run_revision=current.revision,
                     expected_plan_revision=plan.revision,
+                    expected_action_revision=cancelled_action.revision - 1,
                 )
             elif current.active_attempt_id is not None:
                 attempt = await self.store.get_attempt(current.active_attempt_id)
@@ -674,6 +732,10 @@ class ControlPlane:
                         settled,
                         expected_run_revision=current.revision,
                         expected_attempt_revision=attempt.revision,
+                        settled_action=cancelled_action,
+                        expected_action_revision=(
+                            None if cancelled_action is None else cancelled_action.revision - 1
+                        ),
                     )
                 else:
                     await self.store.replace_run(cancelled, expected_revision=current.revision)
@@ -687,7 +749,7 @@ class ControlPlane:
                 task = self._tasks.get(run_id)
             if task is not None:
                 task.cancel()
-        elif current.active_attempt_id is not None:
+        elif current.active_attempt_id is not None and not was_waiting_for_action:
             await self._block_conversation(
                 current.conversation_id,
                 "active conversation Run was cancelled; Session reconciliation is required",
@@ -717,6 +779,18 @@ class ControlPlane:
                     "plan_sha256": cancelled_plan.plan_sha256,
                     "actor": principal.principal_id,
                     "reason": "run_cancelled",
+                },
+            )
+        if cancelled_action is not None:
+            await self.store.append_event(
+                run_id=run_id,
+                attempt_id=current.active_attempt_id,
+                source=EventSource.CONTROL,
+                kind="run.action_cancelled",
+                data={
+                    "action_id": cancelled_action.action_id,
+                    "type": cancelled_action.type.value,
+                    "actor": principal.principal_id,
                 },
             )
         await self._audit_run(principal, cancelled, "run.cancel", "success")
@@ -767,31 +841,198 @@ class ControlPlane:
         principal: Principal,
         run_id: str,
         *,
-        input: str,
-    ) -> RunRecord:
+        action_id: str,
+        expected_revision: int,
+        response: dict[str, Any],
+    ) -> RunView:
         await self._ensure_started()
-        del input
-        run = await self._owned_run(principal, run_id)
-        if run.status is not RunStatus.WAITING:
+        snapshot = await self._owned_run(principal, run_id)
+        if snapshot.status is not RunStatus.WAITING:
             raise RunTransitionError("only a waiting Run can be resumed")
-        if run.phase is RunPhase.WAITING_APPROVAL:
-            raise RunTransitionError(
-                "Plan-ReAct Runs continue through /approve or /reject, not /resume"
+        if snapshot.required_action_id != action_id:
+            raise RunTransitionError("RequiredAction is no longer current for this Run")
+        if snapshot.revision != expected_revision:
+            raise RunTransitionError("Run revision changed; refresh before resuming")
+        try:
+            pending_action = await self.store.get_required_action(action_id)
+        except RequiredActionNotFoundError as exc:
+            raise RunTransitionError(str(exc)) from exc
+        if pending_action.type is RequiredActionType.PLAN_APPROVAL:
+            try:
+                plan_response = PlanApprovalResponse.model_validate(response)
+            except ValueError as exc:
+                raise RunTransitionError(f"invalid plan-approval response: {exc}") from exc
+            await self._resolve_plan_action(
+                principal,
+                run_id,
+                response=plan_response,
+                action_id=action_id,
+                expected_run_revision=expected_revision,
             )
-        raise RunResumeUnsupported(
-            "the pinned DSH SDK has no Host session-resume method; refusing to fake a new turn"
-        )
+            return await self.view(principal, run_id)
 
-    async def _decide_plan(
+        lock = self._run_locks.setdefault(run_id, asyncio.Lock())
+        async with lock:
+            run = await self._owned_run(principal, run_id)
+            if run.status is not RunStatus.WAITING:
+                raise RunTransitionError("only a waiting Run can be resumed")
+            if run.required_action_id != action_id:
+                raise RunTransitionError("RequiredAction is no longer current for this Run")
+            if run.revision != expected_revision:
+                raise RunTransitionError("Run revision changed; refresh before resuming")
+            if run.conversation_id is None:
+                raise RunTransitionError("user-input continuation requires a Conversation Run")
+            try:
+                action = await self.store.get_required_action(action_id)
+            except RequiredActionNotFoundError as exc:
+                raise RunTransitionError(str(exc)) from exc
+            if action.run_id != run_id or action.conversation_id != run.conversation_id:
+                raise RunTransitionError("RequiredAction does not belong to this Run")
+            if (
+                action.tenant_id != principal.tenant_id
+                or action.principal_id != principal.principal_id
+            ):
+                raise RunAccessDenied("RequiredAction belongs to another tenant or principal")
+            if action.status is not RequiredActionStatus.PENDING:
+                raise RunTransitionError("RequiredAction is no longer pending")
+            if action.expires_at is not None and action.expires_at <= utc_now():
+                if run.active_attempt_id != action.attempt_id:
+                    raise RunTransitionError(
+                        "expired RequiredAction does not match the active Attempt"
+                    )
+                attempt = await self.store.get_attempt(action.attempt_id)
+                now = utc_now()
+                expired_action = action.model_copy(
+                    update={
+                        "status": RequiredActionStatus.EXPIRED,
+                        "revision": action.revision + 1,
+                        "updated_at": now,
+                    }
+                )
+                expired_attempt = attempt.model_copy(
+                    update={
+                        "status": AttemptStatus.CANCELLED,
+                        "dispatch_state": DispatchState.SETTLED,
+                        "revision": attempt.revision + 1,
+                        "error": "RequiredAction expired",
+                        "finished_at": now,
+                        "updated_at": now,
+                    }
+                )
+                expired_run = run.model_copy(
+                    update={
+                        "status": RunStatus.CANCELLED,
+                        "revision": run.revision + 1,
+                        "active_attempt_id": None,
+                        "required_action_id": None,
+                        "error": "RequiredAction expired",
+                        "updated_at": now,
+                    }
+                )
+                try:
+                    await self.store.settle_attempt(
+                        expired_run,
+                        expired_attempt,
+                        expected_run_revision=run.revision,
+                        expected_attempt_revision=attempt.revision,
+                        settled_action=expired_action,
+                        expected_action_revision=action.revision,
+                    )
+                except StoreError as exc:
+                    raise RunTransitionError(
+                        "RequiredAction changed while it was being expired"
+                    ) from exc
+                self._run_done.setdefault(run_id, asyncio.Event()).set()
+                await self.store.append_event(
+                    run_id=run_id,
+                    attempt_id=attempt.attempt_id,
+                    source=EventSource.CONTROL,
+                    kind="run.action_expired",
+                    data={"action_id": action.action_id, "type": action.type.value},
+                )
+                await self._audit_run(
+                    principal,
+                    expired_run,
+                    "run.required_action.expire",
+                    "expired",
+                    attempt_id=attempt.attempt_id,
+                    data={"action_id": action.action_id, "type": action.type.value},
+                )
+                raise RunTransitionError("RequiredAction has expired")
+            if action.type is not RequiredActionType.USER_INPUT:
+                raise RunTransitionError(
+                    f"RequiredAction type '{action.type.value}' cannot be submitted here"
+                )
+            try:
+                validated = validate_user_input_response(
+                    response,
+                    action.payload.get("questions"),
+                )
+            except ValueError as exc:
+                raise RunTransitionError(f"invalid user-input response: {exc}") from exc
+            now = utc_now()
+            answered_action = action.model_copy(
+                update={
+                    "status": RequiredActionStatus.ANSWERED,
+                    "response": validated.model_dump(mode="json"),
+                    "revision": action.revision + 1,
+                    "answered_by": principal.principal_id,
+                    "answered_at": now,
+                    "updated_at": now,
+                }
+            )
+            queued = run.model_copy(
+                update={
+                    "status": RunStatus.QUEUED,
+                    "revision": run.revision + 1,
+                    "active_attempt_id": None,
+                    "error": None,
+                    "updated_at": now,
+                }
+            )
+            try:
+                await self.store.answer_required_action(
+                    queued,
+                    answered_action,
+                    expected_run_revision=run.revision,
+                    expected_action_revision=action.revision,
+                )
+            except StoreError as exc:
+                raise RunTransitionError(
+                    "RequiredAction or Run changed concurrently; refresh before resuming"
+                ) from exc
+        await self.store.append_event(
+            run_id=run_id,
+            attempt_id=action.attempt_id,
+            source=EventSource.CONTROL,
+            kind="run.action_submitted",
+            data={
+                "action_id": action.action_id,
+                "type": action.type.value,
+                "submitted_by": principal.principal_id,
+            },
+        )
+        await self._audit_run(
+            principal,
+            queued,
+            "run.required_action.answer",
+            "accepted",
+            attempt_id=action.attempt_id,
+            data={"action_id": action.action_id, "type": action.type.value},
+        )
+        self._run_done[run_id] = asyncio.Event()
+        if self.auto_execute:
+            await self._schedule_conversation(run.conversation_id, run_id)
+        return await self.view(principal, run_id)
+
+    async def _resolve_plan_action(
         self,
         principal: Principal,
         run_id: str,
         *,
-        plan_id: str,
-        plan_revision: int,
-        plan_sha256: str,
-        approved: bool,
-        comment: str | None,
+        response: PlanApprovalResponse,
+        action_id: str | None = None,
+        expected_run_revision: int | None = None,
     ) -> PlanDecisionView:
         await self._ensure_started()
         lock = self._run_locks.setdefault(run_id, asyncio.Lock())
@@ -802,15 +1043,46 @@ class ControlPlane:
                 or current.phase is not RunPhase.WAITING_APPROVAL
             ):
                 raise PlanDecisionConflict("Run is not waiting for a Plan-ReAct decision")
+            if expected_run_revision is not None and current.revision != expected_run_revision:
+                raise PlanDecisionConflict("Run revision changed; refresh before resuming")
+            current_action_id = current.required_action_id
+            if current_action_id is None:
+                raise PlanDecisionConflict("Run has no pending Plan RequiredAction")
+            if action_id is not None and current_action_id != action_id:
+                raise PlanDecisionConflict("RequiredAction is no longer current for this Run")
+            try:
+                action = await self.store.get_required_action(current_action_id)
+            except RequiredActionNotFoundError as exc:
+                raise PlanDecisionConflict(str(exc)) from exc
+            if action.run_id != run_id or action.attempt_id != current.active_attempt_id:
+                raise PlanDecisionConflict("Plan RequiredAction does not belong to this Run")
+            if action.conversation_id != current.conversation_id:
+                raise PlanDecisionConflict("Plan RequiredAction has invalid Conversation ownership")
+            if (
+                action.tenant_id != principal.tenant_id
+                or action.principal_id != principal.principal_id
+            ):
+                raise RunAccessDenied("RequiredAction belongs to another tenant or principal")
+            if action.type is not RequiredActionType.PLAN_APPROVAL:
+                raise PlanDecisionConflict("current RequiredAction is not a Plan approval")
+            if action.status is not RequiredActionStatus.PENDING:
+                raise PlanDecisionConflict("Plan RequiredAction is no longer pending")
             plan = await self.store.get_plan(run_id)
             if plan.status is not PlanStatus.PENDING:
                 raise PlanDecisionConflict(f"Plan is already {plan.status.value}")
-            if plan.plan_id != plan_id:
+            if plan.plan_id != response.plan_id:
                 raise PlanDecisionConflict("plan_id does not match the pending Plan")
-            if plan.revision != plan_revision:
+            if plan.revision != response.plan_revision:
                 raise PlanDecisionConflict("Plan revision changed; reload it before deciding")
-            if plan.plan_sha256 != plan_sha256:
+            if plan.plan_sha256 != response.plan_sha256:
                 raise PlanDecisionConflict("plan_sha256 does not match the pending Plan")
+            if (
+                action.payload.get("plan_id") != plan.plan_id
+                or action.payload.get("plan_revision") != plan.revision
+                or action.payload.get("plan_sha256") != plan.plan_sha256
+            ):
+                raise PlanDecisionConflict("Plan RequiredAction does not match the stored Plan")
+            approved = response.decision is PlanApprovalDecision.APPROVE
             if approved:
                 # Verify both the immutable template and arguments again at the
                 # approval boundary. Execution repeats the same verification.
@@ -825,8 +1097,18 @@ class ControlPlane:
                     "status": decision,
                     "revision": plan.revision + 1,
                     "decided_by": principal.principal_id,
-                    "decision_comment": comment,
+                    "decision_comment": response.comment,
                     "decided_at": now,
+                    "updated_at": now,
+                }
+            )
+            resolved_action = action.model_copy(
+                update={
+                    "status": RequiredActionStatus.CONSUMED,
+                    "response": response.model_dump(mode="json"),
+                    "revision": action.revision + 1,
+                    "answered_by": principal.principal_id,
+                    "answered_at": now,
                     "updated_at": now,
                 }
             )
@@ -836,6 +1118,7 @@ class ControlPlane:
                     "phase": RunPhase.EXECUTING if approved else current.phase,
                     "revision": current.revision + 1,
                     "active_attempt_id": None,
+                    "required_action_id": None,
                     "error": None if approved else "Plan rejected by approver",
                     "cancel_requested": not approved,
                     "updated_at": now,
@@ -845,13 +1128,27 @@ class ControlPlane:
                 await self.store.decide_plan(
                     decided_run,
                     decided_plan,
+                    resolved_action,
                     expected_run_revision=current.revision,
                     expected_plan_revision=plan.revision,
+                    expected_action_revision=action.revision,
                 )
             except StoreError as exc:
                 raise PlanDecisionConflict(str(exc)) from exc
 
         outcome = "approved" if approved else "rejected"
+        await self.store.append_event(
+            run_id=run_id,
+            attempt_id=action.attempt_id,
+            source=EventSource.CONTROL,
+            kind="run.action_submitted",
+            data={
+                "action_id": action.action_id,
+                "type": action.type.value,
+                "decision": response.decision.value,
+                "submitted_by": principal.principal_id,
+            },
+        )
         await self.store.append_event(
             run_id=run_id,
             attempt_id=current.active_attempt_id,
@@ -861,6 +1158,7 @@ class ControlPlane:
                 "plan_id": decided_plan.plan_id,
                 "plan_revision": decided_plan.revision,
                 "plan_sha256": decided_plan.plan_sha256,
+                "action_id": action.action_id,
                 "actor": principal.principal_id,
             },
         )
@@ -873,6 +1171,7 @@ class ControlPlane:
                 "plan_id": decided_plan.plan_id,
                 "plan_revision": decided_plan.revision,
                 "plan_sha256": decided_plan.plan_sha256,
+                "action_id": action.action_id,
             },
         )
         if approved and self.auto_execute:
@@ -1446,6 +1745,8 @@ class ControlPlane:
         run: RunRecord | None = None
         holder: _ConversationRuntimeHolder | None = None
         gateway_bound = False
+        pending_action: RequiredActionRecord | None = None
+        turn_input = ""
         try:
             lock = self._run_locks.setdefault(run_id, asyncio.Lock())
             async with lock:
@@ -1459,16 +1760,40 @@ class ControlPlane:
                     run_id=run_id,
                     number=current.attempt_count + 1,
                     dsh_session_id=conversation.dsh_session_id,
+                    phase=current.phase,
                     worker_id=None if lease is None else lease.worker_id,
                     lease_token=None if lease is None else lease.lease_token,
                 )
                 now = utc_now()
+                consumed_action: RequiredActionRecord | None = None
+                expected_action_revision: int | None = None
+                if current.required_action_id is None:
+                    turn_input = current.input
+                else:
+                    action = await self.store.get_required_action(current.required_action_id)
+                    if action.status is not RequiredActionStatus.ANSWERED:
+                        raise RunTransitionError(
+                            "queued continuation does not have an answered RequiredAction"
+                        )
+                    if action.response is None:
+                        raise RunTransitionError("answered RequiredAction has no response")
+                    turn_input = _render_required_action_response(action)
+                    expected_action_revision = action.revision
+                    consumed_action = action.model_copy(
+                        update={
+                            "status": RequiredActionStatus.CONSUMED,
+                            "revision": action.revision + 1,
+                            "consumed_by_attempt_id": attempt.attempt_id,
+                            "updated_at": now,
+                        }
+                    )
                 run = current.model_copy(
                     update={
                         "status": RunStatus.RUNNING,
                         "revision": current.revision + 1,
                         "attempt_count": attempt.number,
                         "active_attempt_id": attempt.attempt_id,
+                        "required_action_id": None,
                         "updated_at": now,
                     }
                 )
@@ -1484,6 +1809,8 @@ class ControlPlane:
                     attempt,
                     expected_run_revision=current.revision,
                     lease=lease,
+                    consumed_action=consumed_action,
+                    expected_action_revision=expected_action_revision,
                 )
             await self.store.append_event(
                 run_id=run_id,
@@ -1495,6 +1822,11 @@ class ControlPlane:
                     "conversation_id": conversation.conversation_id,
                     "sequence": run.sequence,
                     "dsh_session_id": attempt.dsh_session_id,
+                    **(
+                        {"resumed_action_id": consumed_action.action_id}
+                        if consumed_action is not None
+                        else {}
+                    ),
                 },
             )
             await self._audit_run(
@@ -1564,6 +1896,53 @@ class ControlPlane:
                 attempt.attempt_id,
             )
             if holder.tool_gateway is not None:
+                async def request_user_input(request: AskUserQuestionRequest) -> str:
+                    nonlocal pending_action
+                    if pending_action is not None:
+                        raise RunTransitionError(
+                            "this Attempt already created a RequiredAction"
+                        )
+                    now = utc_now()
+                    action = RequiredActionRecord(
+                        run_id=run_id,
+                        attempt_id=attempt.attempt_id,
+                        conversation_id=conversation.conversation_id,
+                        tenant_id=run.tenant_id,
+                        principal_id=run.principal_id,
+                        type=RequiredActionType.USER_INPUT,
+                        source=RequiredActionSource.MODEL,
+                        payload=request.model_dump(mode="json"),
+                        expires_at=now + timedelta(seconds=self.user_input_timeout_seconds),
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    await self.store.enter_required_action(action, lease=lease)
+                    pending_action = action
+                    await self.store.append_event(
+                        run_id=run_id,
+                        attempt_id=attempt.attempt_id,
+                        source=EventSource.CONTROL,
+                        kind="run.requires_action",
+                        data={
+                            "action_id": action.action_id,
+                            "type": action.type.value,
+                            "source": action.source.value,
+                            "payload": action.payload,
+                            "expires_at": action.expires_at.isoformat()
+                            if action.expires_at is not None
+                            else None,
+                        },
+                    )
+                    await self._audit_run(
+                        Principal(run.tenant_id, run.principal_id),
+                        run,
+                        "run.required_action.create",
+                        "waiting",
+                        attempt_id=attempt.attempt_id,
+                        data={"action_id": action.action_id, "type": action.type.value},
+                    )
+                    return action.action_id
+
                 holder.tool_gateway.bind(
                     GatewayRunContext(
                         principal=Principal(run.tenant_id, run.principal_id),
@@ -1573,6 +1952,7 @@ class ControlPlane:
                     write_event=write_event,
                     write_audit=write_audit,
                     write_artifact=write_artifact,
+                    request_user_input=(request_user_input if agent.allow_user_input else None),
                 )
                 gateway_bound = True
             if holder.memory_gateway is not None:
@@ -1583,7 +1963,7 @@ class ControlPlane:
                         run_id=run_id,
                         attempt_id=attempt.attempt_id,
                         dsh_session_id=conversation.dsh_session_id,
-                        query=run.input,
+                        query=turn_input,
                     ),
                     write_event=write_event,
                     write_audit=write_audit,
@@ -1613,13 +1993,16 @@ class ControlPlane:
                 await write_event(EventSource.DSH, kind, data)
 
             result = await holder.runtime.run(
-                run.input,
+                turn_input,
                 session_id=conversation.dsh_session_id,
                 on_event=on_dsh_event,
                 on_notification=self._notification_handler(run, attempt),
             )
             if result.session_id != conversation.dsh_session_id:
                 raise RuntimeError("DSH returned a different Session ID")
+            if pending_action is not None:
+                self._run_done.setdefault(run_id, asyncio.Event()).set()
+                return False
             if not dispatch_accepted:
                 await self._set_dispatch_state(
                     attempt.attempt_id,
@@ -1641,6 +2024,13 @@ class ControlPlane:
         except LeaseLostError:
             return False
         except BaseException as exc:
+            if pending_action is not None:
+                _LOGGER.warning(
+                    "DSH Turn ended with %s after Run %s entered durable user-input waiting",
+                    type(exc).__name__,
+                    run_id,
+                )
+                return False
             if run is not None and attempt is not None:
                 try:
                     await self._settle_failure(run, attempt, exc, lease=lease)
@@ -1679,7 +2069,7 @@ class ControlPlane:
         gateway: ToolGateway | None = None
         memory_gateway: MemoryContextGateway | None = None
         try:
-            if agent.tools:
+            if agent.tools or agent.allow_user_input:
                 gateway = ToolGateway(agent=agent, authorizer=self.authorizer)
                 await gateway.start()
             if agent.memory_providers:
@@ -1785,11 +2175,31 @@ class ControlPlane:
                     "updated_at": now,
                 }
             )
+            action = RequiredActionRecord(
+                run_id=current.run_id,
+                attempt_id=settled_attempt.attempt_id,
+                conversation_id=current.conversation_id,
+                tenant_id=current.tenant_id,
+                principal_id=current.principal_id,
+                type=RequiredActionType.PLAN_APPROVAL,
+                source=RequiredActionSource.POLICY,
+                payload={
+                    "plan_id": plan.plan_id,
+                    "plan_revision": plan.revision,
+                    "plan_sha256": plan.plan_sha256,
+                    "summary": plan.summary,
+                    "steps": [step.model_dump(mode="json") for step in plan.steps],
+                    "requested_tools": list(plan.requested_tools),
+                    "workflow_id": plan.workflow_id,
+                    "workflow_version": plan.workflow_version,
+                },
+            )
             waiting_run = current.model_copy(
                 update={
                     "status": RunStatus.WAITING,
                     "phase": RunPhase.WAITING_APPROVAL,
                     "plan_id": plan.plan_id,
+                    "required_action_id": action.action_id,
                     "revision": current.revision + 1,
                     "output": None,
                     "error": None,
@@ -1800,6 +2210,7 @@ class ControlPlane:
                 waiting_run,
                 settled_attempt,
                 plan,
+                action,
                 expected_run_revision=current.revision,
                 expected_attempt_revision=attempt.revision,
                 lease=lease,
@@ -1813,8 +2224,20 @@ class ControlPlane:
                 "plan_id": plan.plan_id,
                 "plan_revision": plan.revision,
                 "plan_sha256": plan.plan_sha256,
+                "action_id": action.action_id,
                 "step_count": len(plan.steps),
                 "requested_tools": list(plan.requested_tools),
+            },
+        )
+        await self.store.append_event(
+            run_id=waiting_run.run_id,
+            attempt_id=settled_attempt.attempt_id,
+            source=EventSource.CONTROL,
+            kind="run.requires_action",
+            data={
+                "action_id": action.action_id,
+                "type": action.type.value,
+                "source": action.source.value,
             },
         )
         await self._audit_run(
@@ -1827,6 +2250,7 @@ class ControlPlane:
                 "plan_id": plan.plan_id,
                 "plan_revision": plan.revision,
                 "plan_sha256": plan.plan_sha256,
+                "action_id": action.action_id,
             },
         )
 
@@ -1961,6 +2385,7 @@ class ControlPlane:
                 AttemptStatus.FAILED,
                 AttemptStatus.CANCELLED,
                 AttemptStatus.INTERRUPTED,
+                AttemptStatus.WAITING,
             }
             or current.dispatch_state is state
         ):
@@ -2099,6 +2524,19 @@ class ControlPlane:
             )
 
         return publish
+
+
+def _render_required_action_response(action: RequiredActionRecord) -> str:
+    if action.response is None:
+        raise ValueError("RequiredAction response is missing")
+    return (
+        "[base-agent required action response]\n\n"
+        f"action_id: {action.action_id}\n"
+        f"type: {action.type.value}\n\n"
+        "The user answered the questions from the previous turn:\n\n"
+        f"{json.dumps(action.response, ensure_ascii=False, separators=(',', ':'))}\n\n"
+        "Continue the unfinished task using this answer. Do not ask the same question again."
+    )
 
 
 def _project_dsh_event(event: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:

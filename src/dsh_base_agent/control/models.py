@@ -76,6 +76,30 @@ class PlanStatus(StrEnum):
     REJECTED = "rejected"
 
 
+class PlanApprovalDecision(StrEnum):
+    APPROVE = "approve"
+    REJECT = "reject"
+
+
+class RequiredActionType(StrEnum):
+    USER_INPUT = "user_input"
+    PLAN_APPROVAL = "plan_approval"
+
+
+class RequiredActionSource(StrEnum):
+    MODEL = "model"
+    POLICY = "policy"
+    TOOL = "tool"
+
+
+class RequiredActionStatus(StrEnum):
+    PENDING = "pending"
+    ANSWERED = "answered"
+    CONSUMED = "consumed"
+    EXPIRED = "expired"
+    CANCELLED = "cancelled"
+
+
 class ConversationRecord(BaseModel):
     """Business owner and serialization boundary for one DSH Session."""
 
@@ -119,6 +143,7 @@ class RunRecord(BaseModel):
     revision: int = Field(default=1, ge=1)
     attempt_count: int = Field(default=0, ge=0)
     active_attempt_id: str | None = None
+    required_action_id: str | None = None
     output: str | None = None
     error: str | None = None
     cancel_requested: bool = False
@@ -197,6 +222,43 @@ class ArtifactRecord(BaseModel):
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     size_bytes: int = Field(ge=0)
     created_at: datetime = Field(default_factory=utc_now)
+
+
+class RequiredActionRecord(BaseModel):
+    """Durable action that must be resolved before a business Run may continue."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    action_id: str = Field(default_factory=lambda: new_id("action"))
+    run_id: str
+    attempt_id: str
+    conversation_id: str | None = None
+    tenant_id: str = Field(min_length=1)
+    principal_id: str = Field(min_length=1)
+    type: RequiredActionType
+    source: RequiredActionSource
+    status: RequiredActionStatus = RequiredActionStatus.PENDING
+    payload: dict[str, Any]
+    response: dict[str, Any] | None = None
+    revision: int = Field(default=1, ge=1)
+    expires_at: datetime | None = None
+    answered_by: str | None = None
+    answered_at: datetime | None = None
+    consumed_by_attempt_id: str | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class PlanApprovalResponse(BaseModel):
+    """Exact human decision submitted for a pending Plan RequiredAction."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    decision: PlanApprovalDecision
+    plan_id: str = Field(min_length=1)
+    plan_revision: int = Field(ge=1)
+    plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    comment: str | None = Field(default=None, max_length=4_000)
 
 
 class PlanStep(BaseModel):

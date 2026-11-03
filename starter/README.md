@@ -129,8 +129,8 @@ Starter 同时注册了 `iris-plan-react-1`。它与普通订单 Agent 使用相
 
 业务开发者不需要在 Agent 定义里手写 Workflow JavaScript。模型只生成结构化的步骤、依赖关系
 和所需 Tool 名称；base-agent 使用版本化的固定模板编译脚本，并将 Plan、模板哈希和参数哈希一起
-持久化。审批必须回传读取到的 `plan_id`、`revision` 和 `plan_sha256`，所以不能误批已经变化的
-计划。
+持久化。planning 完成时还会创建 `type=plan_approval` 的 `RequiredAction`。审批必须回传读取到的
+Action ID、Run revision、`plan_id`、Plan revision 和 `plan_sha256`，所以不能误批已经变化的计划。
 
 启动 API（PostgreSQL 模式还要启动 Worker）后，可直接运行完整冒烟测试：
 
@@ -148,27 +148,76 @@ curl -sS -X POST http://127.0.0.1:8000/v1/runs \
   -d '{"agent_id":"iris-plan-react-1","input":"查询 order-001 并给出状态"}'
 ```
 
-Run 进入 `status=waiting, phase=waiting_approval` 后读取 Plan：
+Run 进入 `status=waiting, phase=waiting_approval` 后读取 Run Action 和 Plan：
 
 ```bash
+curl -sS http://127.0.0.1:8000/v1/runs/{run_id} \
+  -H 'X-Tenant-ID: demo-tenant' \
+  -H 'X-Principal-ID: demo-user'
+
 curl -sS http://127.0.0.1:8000/v1/runs/{run_id}/plan \
   -H 'X-Tenant-ID: demo-tenant' \
   -H 'X-Principal-ID: demo-user'
 ```
 
-再把响应中的三个并发控制字段原样提交到审批接口：
+再通过统一 RequiredAction 接口提交决定：
 
 ```bash
-curl -sS -X POST http://127.0.0.1:8000/v1/runs/{run_id}/approve \
+curl -sS -X POST http://127.0.0.1:8000/v1/runs/{run_id}/resume \
   -H 'Content-Type: application/json' \
   -H 'X-Tenant-ID: demo-tenant' \
   -H 'X-Principal-ID: demo-user' \
-  -d '{"plan_id":"plan_...","plan_revision":1,"plan_sha256":"...","comment":"同意"}'
+  -d '{
+    "action_id":"action_...",
+    "expected_revision":3,
+    "response":{
+      "decision":"approve",
+      "plan_id":"plan_...",
+      "plan_revision":1,
+      "plan_sha256":"...",
+      "comment":"同意"
+    }
+  }'
 ```
 
-拒绝时使用相同请求体调用 `/v1/runs/{run_id}/reject`。Plan-ReAct 当前只支持独立
+拒绝时把 `decision` 改为 `reject`。原 `/approve`、`/reject` 仍是兼容入口，但内部走同一个
+RequiredAction 转换。Plan-ReAct 当前只支持独立
 `POST /v1/runs`，不支持 Conversation，因为人工审批可能跨进程、跨较长时间，不应依赖一个仍然
 存活的 Conversation Runtime。
+
+## 模型动态提问与 RequiredAction
+
+Starter 注册的 `iris-user-input-1` 设置了 `allow_user_input=True`。当完成任务缺少用户信息时，
+模型必须调用 base-agent 自动提供的 `ask_user_question` Tool。调用会持久化
+`RequiredAction`，让当前 Run/Attempt 进入 `waiting` 并结束本次 DSH Turn；它不会要求原 Worker
+或 Runtime 一直存活。
+
+启动 API（PostgreSQL 模式还要启动 Worker）后运行：
+
+```bash
+uv run python scripts/user_input_smoke.py
+```
+
+脚本会创建 Conversation、提交消息、从 `GET /v1/runs/{run_id}` 读取
+`required_action`、选择第一个选项并调用：
+
+```json
+POST /v1/runs/{run_id}/resume
+{
+  "action_id": "action_...",
+  "expected_revision": 3,
+  "response": {
+    "answers": [
+      {"id": "shipping_method", "selected": ["普通配送"]}
+    ]
+  }
+}
+```
+
+`expected_revision` 是查询响应中的 `run.revision`。回答后同一个 Run、Conversation 和
+`dsh_session_id` 会创建新的 Attempt/Turn 继续执行。该能力只支持 Conversation Run；对
+`iris-user-input-1` 调用独立 `POST /v1/runs` 会返回 `409`。完整协议见主项目的
+[`docs/required-actions.md`](../docs/required-actions.md)。
 
 查看和下载大 Tool Result：
 
@@ -311,5 +360,5 @@ Memory Provider 已纳入权限、超时、有界 Event/Audit 和 16 KiB 模型�
 - SQLite 只适用于单进程；PostgreSQL Worker 已具备第一版 lease/heartbeat/fencing；
 - Workspace 是本地目录，尚未接入 S3 materialize/commit；
 - Tool JSON 大结果已自动写 LocalArtifactStore；S3、容量配额和 TTL 尚未实现；
-- `resume` 受当前 DSH SDK 能力限制；
+- `resume` 已支持 Conversation RequiredAction；被中断的原 DSH Turn 仍不能透明恢复；
 - 示例 Authorizer 和内存订单数据仅用于演示，必须由业务实现替换。

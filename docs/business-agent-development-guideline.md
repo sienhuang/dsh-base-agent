@@ -415,7 +415,29 @@ GET  /v1/conversations/{conversation_id}/runs
 同一 Conversation 固定 Tenant、Principal、Agent 版本、DSH Home 和 Session。服务端保证 Run
 按 sequence 串行执行；客户端不要并发假设后一个 Turn 已看到尚未完成的前一个 Turn。
 
-### 10.3 事件和 Artifact
+### 10.3 模型动态提问
+
+需要让模型在缺少用户选择或材料信息时动态生成问题，使用独立的 Conversation Agent：
+
+```python
+agent = Agent(
+    name="interactive-order-assistant",
+    prompt="缺少用户信息时调用 ask_user_question；成功后立即结束当前 Turn。",
+    tools=(query_order,),
+    allow_user_input=True,
+)
+```
+
+base-agent 会自动提供该 Tool。Run 进入 `waiting` 后，调用方从
+`GET /v1/runs/{run_id}` 读取 `required_action`，再把其中的 `action_id` 与刚读取的
+`run.revision` 提交给 `POST /v1/runs/{run_id}/resume`。回答会在同一个 Conversation 和 DSH
+Session 上创建新的 Attempt/Turn，而不是恢复旧调用栈。完整请求结构见
+[`required-actions.md`](required-actions.md)。
+
+不要用这项模型自主提问能力代替付款、删除、发布等治理审批；治理动作必须由 ControlPlane
+策略确定。
+
+### 10.4 事件和 Artifact
 
 ```text
 GET /v1/runs/{run_id}/events?after=<sequence>

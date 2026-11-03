@@ -12,6 +12,8 @@ from dsh_base_agent import (
     ControlPlane,
     PlanReact,
     Principal,
+    RequiredActionStatus,
+    RequiredActionType,
     RunPhase,
     RunStatus,
     RuntimeConfig,
@@ -170,6 +172,16 @@ def test_plan_react_reserves_internal_submit_plan_tool_name() -> None:
         )
 
 
+def test_plan_react_cannot_mix_with_conversation_user_input() -> None:
+    with pytest.raises(ValueError, match="cannot be enabled"):
+        Agent(
+            name="ambiguous-planner",
+            prompt="Plan and ask.",
+            plan_react=PlanReact(),
+            allow_user_input=True,
+        )
+
+
 async def test_plan_react_requires_exact_approval_then_executes_pinned_workflow(
     tmp_path: Path,
 ) -> None:
@@ -191,10 +203,20 @@ async def test_plan_react_requires_exact_approval_then_executes_pinned_workflow(
         )
         waiting = await control.wait(submitted.run_id)
         plan = await control.get_plan(principal, submitted.run_id)
+        waiting_view = await control.view(principal, submitted.run_id)
+        action = waiting_view.required_action
 
         assert waiting.status is RunStatus.WAITING
         assert waiting.phase is RunPhase.WAITING_APPROVAL
         assert waiting.plan_id == plan.plan_id
+        assert action is not None
+        assert waiting.required_action_id == action.action_id
+        assert action.type is RequiredActionType.PLAN_APPROVAL
+        assert action.status is RequiredActionStatus.PENDING
+        assert action.conversation_id is None
+        assert action.payload["plan_id"] == plan.plan_id
+        assert action.payload["plan_revision"] == plan.revision
+        assert action.payload["plan_sha256"] == plan.plan_sha256
         assert plan.status.value == "pending"
         assert plan.workflow_script_sha256
         assert plan.workflow_args_sha256
@@ -218,7 +240,17 @@ async def test_plan_react_requires_exact_approval_then_executes_pinned_workflow(
         )
         assert decision.run.status is RunStatus.QUEUED
         assert decision.run.phase is RunPhase.EXECUTING
+        assert decision.run.required_action_id is None
         assert decision.plan.status.value == "approved"
+        resolved_action = await control.store.get_required_action(action.action_id)
+        assert resolved_action.status is RequiredActionStatus.CONSUMED
+        assert resolved_action.response == {
+            "decision": "approve",
+            "plan_id": plan.plan_id,
+            "plan_revision": plan.revision,
+            "plan_sha256": plan.plan_sha256,
+            "comment": "approved in test",
+        }
 
         completed = await control.wait(submitted.run_id)
         attempts = (await control.view(principal, submitted.run_id)).attempts
@@ -237,6 +269,8 @@ async def test_plan_react_requires_exact_approval_then_executes_pinned_workflow(
         assert workflow.args_sha256 == plan.workflow_args_sha256
         assert {item.kind for item in events} >= {
             "plan.proposed",
+            "run.requires_action",
+            "run.action_submitted",
             "plan.approved",
             "workflow.started",
             "workflow.completed",
@@ -281,6 +315,40 @@ async def test_rejected_plan_never_executes(tmp_path: Path) -> None:
         await control.close()
 
 
+async def test_cancelling_pending_plan_cancels_required_action(tmp_path: Path) -> None:
+    control = ControlPlane(
+        workspace=tmp_path,
+        runtime=RuntimeConfig(provider="test", model="test", dsh_home=tmp_path / "dsh"),
+        store=SqliteControlStore(tmp_path / "control.db"),
+        runtime_factory=PlanRuntimeFactory(),
+    )
+    control.register(plan_agent())
+    principal = Principal("tenant-a", "alice")
+    await control.start()
+    try:
+        submitted = await control.submit(
+            principal=principal,
+            agent_id="governed-orders",
+            input="Inspect and update order-001.",
+        )
+        await control.wait(submitted.run_id)
+        waiting_view = await control.view(principal, submitted.run_id)
+        assert waiting_view.required_action is not None
+
+        cancelled = await control.cancel(principal, submitted.run_id)
+        action = await control.store.get_required_action(
+            waiting_view.required_action.action_id
+        )
+        plan = await control.get_plan(principal, submitted.run_id)
+
+        assert cancelled.status is RunStatus.CANCELLED
+        assert cancelled.required_action_id is None
+        assert action.status is RequiredActionStatus.CANCELLED
+        assert plan.status.value == "rejected"
+    finally:
+        await control.close()
+
+
 async def test_plan_react_http_contract(tmp_path: Path) -> None:
     control = ControlPlane(
         workspace=tmp_path,
@@ -309,30 +377,66 @@ async def test_plan_react_http_contract(tmp_path: Path) -> None:
             response = await client.get(f"/v1/runs/{run_id}/plan", headers=headers)
             assert response.status_code == 200
             plan = response.json()
+            view_response = await client.get(f"/v1/runs/{run_id}", headers=headers)
+            action = view_response.json()["required_action"]
+            assert action["type"] == "plan_approval"
 
             response = await client.post(
-                f"/v1/runs/{run_id}/approve",
+                f"/v1/runs/{run_id}/resume",
                 headers=headers,
                 json={
-                    "plan_id": plan["plan_id"],
-                    "plan_revision": plan["revision"],
-                    "plan_sha256": plan["plan_sha256"],
+                    "action_id": action["action_id"],
+                    "expected_revision": view_response.json()["run"]["revision"],
+                    "response": {
+                        "decision": "approve",
+                        "plan_id": plan["plan_id"],
+                        "plan_revision": plan["revision"],
+                        "plan_sha256": plan["plan_sha256"],
+                    },
                 },
             )
-            assert response.status_code == 202
-            assert response.json()["run"]["phase"] == "executing"
-            assert response.json()["plan"]["status"] == "approved"
+            assert response.status_code == 200
+            assert response.json()["required_action"] is None
 
             conflict = await client.post(
-                f"/v1/runs/{run_id}/approve",
+                f"/v1/runs/{run_id}/resume",
                 headers=headers,
                 json={
-                    "plan_id": plan["plan_id"],
-                    "plan_revision": plan["revision"],
-                    "plan_sha256": plan["plan_sha256"],
+                    "action_id": action["action_id"],
+                    "expected_revision": view_response.json()["run"]["revision"],
+                    "response": {
+                        "decision": "approve",
+                        "plan_id": plan["plan_id"],
+                        "plan_revision": plan["revision"],
+                        "plan_sha256": plan["plan_sha256"],
+                    },
                 },
             )
             assert conflict.status_code == 409
             assert (await control.wait(run_id)).status is RunStatus.SUCCEEDED
+
+            # Legacy endpoint remains an adapter over the same RequiredAction transition.
+            second = await client.post(
+                "/v1/runs",
+                headers=headers,
+                json={"agent_id": "governed-orders", "input": "Update order-002."},
+            )
+            second_run_id = second.json()["run_id"]
+            await control.wait(second_run_id)
+            second_plan = (
+                await client.get(f"/v1/runs/{second_run_id}/plan", headers=headers)
+            ).json()
+            compatible = await client.post(
+                f"/v1/runs/{second_run_id}/approve",
+                headers=headers,
+                json={
+                    "plan_id": second_plan["plan_id"],
+                    "plan_revision": second_plan["revision"],
+                    "plan_sha256": second_plan["plan_sha256"],
+                },
+            )
+            assert compatible.status_code == 202
+            assert compatible.json()["plan"]["status"] == "approved"
+            assert (await control.wait(second_run_id)).status is RunStatus.SUCCEEDED
     finally:
         await control.close()

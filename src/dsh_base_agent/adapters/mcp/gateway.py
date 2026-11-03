@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import json
 import socket
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
@@ -20,11 +20,13 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from dsh_base_agent.control.auth import Authorizer, Principal, ToolAuthorization
 from dsh_base_agent.control.models import ArtifactRecord, EventSource
 from dsh_base_agent.sdk.agent import Agent
-from dsh_base_agent.sdk.tools import ToolContext
+from dsh_base_agent.sdk.tools import SideEffect, Tool, ToolContext, ToolReadiness, ToolSpec
+from dsh_base_agent.sdk.user_input import ASK_USER_TOOL_NAME, AskUserQuestionRequest
 
 type EventWriter = Callable[[EventSource, str, dict[str, Any]], Awaitable[None]]
 type AuditWriter = Callable[[str, str, str, dict[str, Any]], Awaitable[None]]
 type ArtifactWriter = Callable[[str, str, bytes], Awaitable[ArtifactRecord]]
+type UserInputWriter = Callable[[AskUserQuestionRequest], Awaitable[str]]
 
 
 class ToolGatewayError(RuntimeError):
@@ -74,6 +76,54 @@ class _GatewayBinding:
     write_event: EventWriter
     write_audit: AuditWriter
     write_artifact: ArtifactWriter | None
+    request_user_input: UserInputWriter | None
+
+
+class _AskUserQuestionTool:
+    """Host-owned durable alternative to DSH's live blocking question Tool."""
+
+    def __init__(self, gateway: ToolGateway) -> None:
+        self._gateway = gateway
+        self._spec = ToolSpec(
+            name=ASK_USER_TOOL_NAME,
+            description=(
+                "Ask the user one or more concise questions when required information is "
+                "missing. This records a durable required action. After it succeeds, do not "
+                "call another tool; end the current turn and wait for the user."
+            ),
+            input_schema=AskUserQuestionRequest.model_json_schema(),
+        )
+
+    @property
+    def spec(self) -> ToolSpec:
+        return self._spec
+
+    @property
+    def permissions(self) -> frozenset[str]:
+        return frozenset()
+
+    @property
+    def timeout_seconds(self) -> float:
+        return 30.0
+
+    @property
+    def side_effect(self) -> SideEffect:
+        return SideEffect.READ_ONLY
+
+    @property
+    def confirmation_required(self) -> bool:
+        return False
+
+    def validate_arguments(self, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+        return AskUserQuestionRequest.model_validate(dict(arguments)).model_dump(mode="json")
+
+    async def check_readiness(self) -> ToolReadiness:
+        return ToolReadiness(True)
+
+    async def invoke(self, arguments: Mapping[str, Any], context: ToolContext) -> Any:
+        del context
+        request = AskUserQuestionRequest.model_validate(dict(arguments))
+        return await self._gateway._request_user_input(request)
 
 
 class ToolGateway:
@@ -101,10 +151,14 @@ class ToolGateway:
         self._default_write_artifact = write_artifact
         self._max_tool_calls = max_tool_calls
         self._max_observation_bytes = max_observation_bytes
-        self._tools = {item.spec.name: item for item in agent.tools}
+        self._tools: dict[str, Tool] = {item.spec.name: item for item in agent.tools}
+        if agent.allow_user_input:
+            self._tools[ASK_USER_TOOL_NAME] = _AskUserQuestionTool(self)
         self._binding: _GatewayBinding | None = None
         self._call_index = 0
         self._call_lock = asyncio.Lock()
+        self._input_lock = asyncio.Lock()
+        self._input_pending: str | None = None
         self._server = Server(f"dsh-base-agent-{agent.name}", version="0.1.0")
         self._manager = StreamableHTTPSessionManager(
             self._server,
@@ -130,7 +184,7 @@ class ToolGateway:
     async def start(self) -> None:
         if self._serve_task is not None:
             return
-        for item in self.agent.tools:
+        for item in self._tools.values():
             readiness = await item.check_readiness()
             if not readiness.ready:
                 detail = f": {readiness.detail}" if readiness.detail else ""
@@ -168,6 +222,7 @@ class ToolGateway:
         write_event: EventWriter | None = None,
         write_audit: AuditWriter | None = None,
         write_artifact: ArtifactWriter | None = None,
+        request_user_input: UserInputWriter | None = None,
     ) -> None:
         if self._binding is not None:
             raise ToolGatewayError("Tool gateway is already bound")
@@ -175,18 +230,23 @@ class ToolGateway:
         selected_audit_writer = write_audit or self._default_write_audit
         if selected_event_writer is None or selected_audit_writer is None:
             raise ToolGatewayError("Tool gateway binding requires event and audit writers")
+        if self.agent.allow_user_input and request_user_input is None:
+            raise ToolGatewayError("user-input-enabled gateway requires a request writer")
         self._binding = _GatewayBinding(
             context=context,
             write_event=selected_event_writer,
             write_audit=selected_audit_writer,
             write_artifact=write_artifact or self._default_write_artifact,
+            request_user_input=request_user_input,
         )
         self._call_index = 0
+        self._input_pending = None
 
     def release(self, attempt_id: str) -> None:
         if self._binding is not None and self._binding.context.attempt_id == attempt_id:
             self._binding = None
             self._call_index = 0
+            self._input_pending = None
 
     async def close(self) -> None:
         server = self._uvicorn
@@ -209,7 +269,7 @@ class ToolGateway:
                     description=item.spec.description,
                     inputSchema=dict(item.spec.input_schema),
                 )
-                for item in self.agent.tools
+                for item in self._tools.values()
             ]
 
         @self._server.call_tool()  # type: ignore[untyped-decorator]
@@ -218,6 +278,10 @@ class ToolGateway:
             if binding is None:
                 raise ToolGatewayError("no RunAttempt owns this Tool call")
             context = binding.context
+            if self._input_pending is not None:
+                raise ToolGatewayError(
+                    "user input is pending; no additional Tool may execute in this Attempt"
+                )
             try:
                 selected = self._tools[name]
             except KeyError as exc:
@@ -336,6 +400,21 @@ class ToolGateway:
                 },
             )
             return observation if isinstance(observation, dict) else {"result": observation}
+
+    async def _request_user_input(self, request: AskUserQuestionRequest) -> dict[str, Any]:
+        async with self._input_lock:
+            if self._input_pending is not None:
+                raise ToolGatewayError("this Attempt already has a pending user-input action")
+            binding = self._binding
+            if binding is None or binding.request_user_input is None:
+                raise ToolGatewayError("no RunAttempt can accept user input")
+            action_id = await binding.request_user_input(request)
+            self._input_pending = action_id
+            return {
+                "status": "waiting_for_user_input",
+                "action_id": action_id,
+                "message": "The request is durable. End this turn and wait for the user.",
+            }
 
 
 def _operation_id(attempt_id: str, operation_index: int) -> str:

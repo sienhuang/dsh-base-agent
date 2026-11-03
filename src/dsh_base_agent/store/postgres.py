@@ -22,6 +22,9 @@ from dsh_base_agent.control.models import (
     DispatchState,
     EventSource,
     PlanRecord,
+    RequiredActionRecord,
+    RequiredActionStatus,
+    RequiredActionType,
     RunAttempt,
     RunEvent,
     RunRecord,
@@ -37,6 +40,7 @@ from dsh_base_agent.store.sqlite import (
     IdempotencyConflictError,
     LeaseLostError,
     PlanNotFoundError,
+    RequiredActionNotFoundError,
     RevisionConflictError,
     RunNotFoundError,
     StoreError,
@@ -267,6 +271,19 @@ class PostgresControlStore:
                         )
                     return await self._get_run(connection, str(prior["run_id"])), False
 
+            waiting = await connection.fetchval(
+                """
+                SELECT 1 FROM runs
+                WHERE conversation_id = $1 AND status = 'waiting'
+                LIMIT 1
+                """,
+                conversation_id,
+            )
+            if waiting is not None:
+                raise StoreError(
+                    f"Conversation '{conversation_id}' has a pending required action"
+                )
+
             persisted = run.model_copy(
                 update={
                     "conversation_id": conversation_id,
@@ -400,8 +417,19 @@ class PostgresControlStore:
         *,
         expected_run_revision: int,
         lease: WorkLease | None = None,
+        consumed_action: RequiredActionRecord | None = None,
+        expected_action_revision: int | None = None,
     ) -> None:
         _validate_revision(run.revision, expected_run_revision, "Run")
+        if (consumed_action is None) != (expected_action_revision is None):
+            raise ValueError("consumed Action and expected revision must be supplied together")
+        if consumed_action is not None:
+            assert expected_action_revision is not None
+            _validate_revision(
+                consumed_action.revision,
+                expected_action_revision,
+                "RequiredAction",
+            )
         pool = self._require_pool()
         async with pool.acquire() as connection, connection.transaction():
             if lease is not None:
@@ -410,6 +438,18 @@ class PostgresControlStore:
             updated = await self._update_run(connection, run, expected_run_revision)
             if updated is None:
                 raise RevisionConflictError(f"Run '{run.run_id}' changed concurrently")
+            if consumed_action is not None:
+                assert expected_action_revision is not None
+                action_updated = await self._update_required_action(
+                    connection,
+                    consumed_action,
+                    expected_action_revision,
+                    expected_status=RequiredActionStatus.ANSWERED,
+                )
+                if action_updated is None:
+                    raise RevisionConflictError(
+                        f"RequiredAction '{consumed_action.action_id}' changed concurrently"
+                    )
 
     async def get_attempt(self, attempt_id: str) -> RunAttempt:
         pool = self._require_pool()
@@ -445,9 +485,20 @@ class PostgresControlStore:
         expected_run_revision: int,
         expected_attempt_revision: int,
         lease: WorkLease | None = None,
+        settled_action: RequiredActionRecord | None = None,
+        expected_action_revision: int | None = None,
     ) -> None:
         _validate_revision(run.revision, expected_run_revision, "Run")
         _validate_revision(attempt.revision, expected_attempt_revision, "RunAttempt")
+        if (settled_action is None) != (expected_action_revision is None):
+            raise ValueError("settled Action and expected revision must be supplied together")
+        if settled_action is not None:
+            assert expected_action_revision is not None
+            _validate_revision(
+                settled_action.revision,
+                expected_action_revision,
+                "RequiredAction",
+            )
         pool = self._require_pool()
         async with pool.acquire() as connection, connection.transaction():
             if lease is not None:
@@ -462,6 +513,18 @@ class PostgresControlStore:
             run_updated = await self._update_run(connection, run, expected_run_revision)
             if run_updated is None:
                 raise RevisionConflictError(f"Run '{run.run_id}' changed concurrently")
+            if settled_action is not None:
+                assert expected_action_revision is not None
+                action_updated = await self._update_required_action(
+                    connection,
+                    settled_action,
+                    expected_action_revision,
+                    expected_status=RequiredActionStatus.PENDING,
+                )
+                if action_updated is None:
+                    raise RevisionConflictError(
+                        f"RequiredAction '{settled_action.action_id}' changed concurrently"
+                    )
 
     async def list_attempts(self, run_id: str) -> tuple[RunAttempt, ...]:
         pool = self._require_pool()
@@ -475,6 +538,111 @@ class PostgresControlStore:
                 run_id,
             )
         return tuple(_model_from_payload(RunAttempt, row["payload"]) for row in rows)
+
+    async def get_required_action(self, action_id: str) -> RequiredActionRecord:
+        pool = self._require_pool()
+        async with pool.acquire() as connection:
+            row = await connection.fetchrow(
+                "SELECT payload FROM required_actions WHERE action_id = $1",
+                action_id,
+            )
+        if row is None:
+            raise RequiredActionNotFoundError(
+                f"RequiredAction '{action_id}' was not found"
+            )
+        return _model_from_payload(RequiredActionRecord, row["payload"])
+
+    async def enter_required_action(
+        self,
+        action: RequiredActionRecord,
+        *,
+        lease: WorkLease | None = None,
+    ) -> tuple[RunRecord, RunAttempt]:
+        if action.status is not RequiredActionStatus.PENDING:
+            raise ValueError("new RequiredAction must be pending")
+        pool = self._require_pool()
+        async with pool.acquire() as connection, connection.transaction():
+            if lease is not None:
+                await self._assert_lease(connection, lease)
+            row = await connection.fetchrow(
+                "SELECT payload FROM runs WHERE run_id = $1 FOR UPDATE",
+                action.run_id,
+            )
+            if row is None:
+                raise RunNotFoundError(f"Run '{action.run_id}' was not found")
+            attempt_row = await connection.fetchrow(
+                "SELECT payload FROM run_attempts WHERE attempt_id = $1 FOR UPDATE",
+                action.attempt_id,
+            )
+            if attempt_row is None:
+                raise AttemptNotFoundError(
+                    f"RunAttempt '{action.attempt_id}' was not found"
+                )
+            run = _model_from_payload(RunRecord, row["payload"])
+            attempt = _model_from_payload(RunAttempt, attempt_row["payload"])
+            if run.status is not RunStatus.RUNNING or run.active_attempt_id != attempt.attempt_id:
+                raise RevisionConflictError("Run is no longer executing this Attempt")
+            if attempt.status is not AttemptStatus.RUNNING:
+                raise RevisionConflictError("RunAttempt is no longer running")
+            if run.conversation_id != action.conversation_id:
+                raise ValueError("RequiredAction does not belong to the Run Conversation")
+            now = utc_now()
+            waiting_run = run.model_copy(
+                update={
+                    "status": RunStatus.WAITING,
+                    "required_action_id": action.action_id,
+                    "revision": run.revision + 1,
+                    "updated_at": now,
+                }
+            )
+            waiting_attempt = attempt.model_copy(
+                update={
+                    "status": AttemptStatus.WAITING,
+                    "dispatch_state": DispatchState.SETTLED,
+                    "finish_reason": "user_input_required",
+                    "revision": attempt.revision + 1,
+                    "finished_at": now,
+                    "updated_at": now,
+                }
+            )
+            await self._insert_required_action(connection, action)
+            attempt_updated = await self._update_attempt(
+                connection,
+                waiting_attempt,
+                attempt.revision,
+            )
+            run_updated = await self._update_run(connection, waiting_run, run.revision)
+            if attempt_updated is None or run_updated is None:
+                raise RevisionConflictError(
+                    f"Run '{run.run_id}' changed while entering required action"
+                )
+            return waiting_run, waiting_attempt
+
+    async def answer_required_action(
+        self,
+        run: RunRecord,
+        action: RequiredActionRecord,
+        *,
+        expected_run_revision: int,
+        expected_action_revision: int,
+    ) -> None:
+        _validate_revision(run.revision, expected_run_revision, "Run")
+        _validate_revision(action.revision, expected_action_revision, "RequiredAction")
+        pool = self._require_pool()
+        async with pool.acquire() as connection, connection.transaction():
+            action_updated = await self._update_required_action(
+                connection,
+                action,
+                expected_action_revision,
+                expected_status=RequiredActionStatus.PENDING,
+            )
+            if action_updated is None:
+                raise RevisionConflictError(
+                    f"RequiredAction '{action.action_id}' changed concurrently"
+                )
+            run_updated = await self._update_run(connection, run, expected_run_revision)
+            if run_updated is None:
+                raise RevisionConflictError(f"Run '{run.run_id}' changed concurrently")
 
     async def get_plan(self, run_id: str) -> PlanRecord:
         pool = self._require_pool()
@@ -492,6 +660,7 @@ class PostgresControlStore:
         run: RunRecord,
         attempt: RunAttempt,
         plan: PlanRecord,
+        action: RequiredActionRecord,
         *,
         expected_run_revision: int,
         expected_attempt_revision: int,
@@ -499,8 +668,19 @@ class PostgresControlStore:
     ) -> None:
         _validate_revision(run.revision, expected_run_revision, "Run")
         _validate_revision(attempt.revision, expected_attempt_revision, "RunAttempt")
-        if plan.run_id != run.run_id or attempt.run_id != run.run_id:
+        if (
+            plan.run_id != run.run_id
+            or attempt.run_id != run.run_id
+            or action.run_id != run.run_id
+            or action.attempt_id != attempt.attempt_id
+        ):
             raise ValueError("planning records must belong to the same Run")
+        if action.type is not RequiredActionType.PLAN_APPROVAL:
+            raise ValueError("planning must create a plan_approval RequiredAction")
+        if action.status is not RequiredActionStatus.PENDING:
+            raise ValueError("new Plan RequiredAction must be pending")
+        if run.required_action_id != action.action_id:
+            raise ValueError("waiting Run must point to its Plan RequiredAction")
         pool = self._require_pool()
         async with pool.acquire() as connection, connection.transaction():
             if lease is not None:
@@ -518,19 +698,25 @@ class PostgresControlStore:
             if run_updated is None:
                 raise RevisionConflictError(f"Run '{run.run_id}' changed concurrently")
             await self._insert_plan(connection, plan)
+            await self._insert_required_action(connection, action)
 
     async def decide_plan(
         self,
         run: RunRecord,
         plan: PlanRecord,
+        action: RequiredActionRecord,
         *,
         expected_run_revision: int,
         expected_plan_revision: int,
+        expected_action_revision: int,
     ) -> None:
         _validate_revision(run.revision, expected_run_revision, "Run")
         _validate_revision(plan.revision, expected_plan_revision, "Plan")
-        if plan.run_id != run.run_id:
-            raise ValueError("Plan must belong to the Run being decided")
+        _validate_revision(action.revision, expected_action_revision, "RequiredAction")
+        if plan.run_id != run.run_id or action.run_id != run.run_id:
+            raise ValueError("Plan and RequiredAction must belong to the Run being decided")
+        if action.type is not RequiredActionType.PLAN_APPROVAL:
+            raise ValueError("Plan decision requires a plan_approval RequiredAction")
         pool = self._require_pool()
         async with pool.acquire() as connection, connection.transaction():
             plan_updated = await self._update_plan(connection, plan, expected_plan_revision)
@@ -539,6 +725,16 @@ class PostgresControlStore:
             run_updated = await self._update_run(connection, run, expected_run_revision)
             if run_updated is None:
                 raise RevisionConflictError(f"Run '{run.run_id}' changed concurrently")
+            action_updated = await self._update_required_action(
+                connection,
+                action,
+                expected_action_revision,
+                expected_status=RequiredActionStatus.PENDING,
+            )
+            if action_updated is None:
+                raise RevisionConflictError(
+                    f"RequiredAction '{action.action_id}' changed concurrently"
+                )
 
     async def append_event(
         self,
@@ -1231,6 +1427,71 @@ class PostgresControlStore:
             attempt.model_dump_json(),
             attempt.attempt_id,
             expected_revision,
+        )
+        return None if value is None else str(value)
+
+    @staticmethod
+    async def _insert_required_action(
+        connection: _PgConnection,
+        action: RequiredActionRecord,
+    ) -> None:
+        await connection.execute(
+            """
+            INSERT INTO required_actions(
+                action_id, run_id, attempt_id, conversation_id, tenant_id, principal_id,
+                type, source, status, revision, expires_at, answered_by, answered_at,
+                consumed_by_attempt_id, created_at, updated_at, payload
+            ) VALUES(
+                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb
+            )
+            """,
+            action.action_id,
+            action.run_id,
+            action.attempt_id,
+            action.conversation_id,
+            action.tenant_id,
+            action.principal_id,
+            action.type.value,
+            action.source.value,
+            action.status.value,
+            action.revision,
+            action.expires_at,
+            action.answered_by,
+            action.answered_at,
+            action.consumed_by_attempt_id,
+            action.created_at,
+            action.updated_at,
+            action.model_dump_json(),
+        )
+
+    @staticmethod
+    async def _update_required_action(
+        connection: _PgConnection,
+        action: RequiredActionRecord,
+        expected_revision: int,
+        *,
+        expected_status: RequiredActionStatus,
+    ) -> str | None:
+        value = await connection.fetchval(
+            """
+            UPDATE required_actions
+            SET status = $1, revision = $2, expires_at = $3, answered_by = $4,
+                answered_at = $5, consumed_by_attempt_id = $6, updated_at = $7,
+                payload = $8::jsonb
+            WHERE action_id = $9 AND revision = $10 AND status = $11
+            RETURNING action_id
+            """,
+            action.status.value,
+            action.revision,
+            action.expires_at,
+            action.answered_by,
+            action.answered_at,
+            action.consumed_by_attempt_id,
+            action.updated_at,
+            action.model_dump_json(),
+            action.action_id,
+            expected_revision,
+            expected_status.value,
         )
         return None if value is None else str(value)
 

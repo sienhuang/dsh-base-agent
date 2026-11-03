@@ -391,7 +391,10 @@ RUNNING + ACCEPTED/DISPATCHING/UNKNOWN
     Conversation 保持 ACTIVE
     不重放原 Run；允许替代 Worker 接收下一个 Turn
 
-WAITING
+WAITING + RequiredAction(USER_INPUT)
+└── 保持等待；通过 /resume 回答后，在同一 Session 创建新的 Attempt/Turn
+
+WAITING + live approval / in-flight Turn
 └── 保持阻塞；只能通过经过 capability 验证的 DSH 扩展恢复
 ```
 

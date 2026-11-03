@@ -22,6 +22,7 @@ from dsh_base_agent.control.models import (
     ArtifactRecord,
     ConversationStatus,
     PlanRecord,
+    RequiredActionRecord,
     RunAttempt,
     RunEvent,
     RunRecord,
@@ -33,7 +34,6 @@ from dsh_base_agent.control.plane import (
     PlanDecisionConflict,
     PlanDecisionView,
     RunAccessDenied,
-    RunResumeUnsupported,
     RunTransitionError,
     RunView,
 )
@@ -70,7 +70,9 @@ class CreateConversationRunRequest(BaseModel):
 class ResumeRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    input: str = Field(min_length=1)
+    action_id: str = Field(min_length=1)
+    expected_revision: int = Field(ge=1)
+    response: dict[str, Any]
 
 
 class PlanDecisionRequest(BaseModel):
@@ -87,6 +89,7 @@ class RunResponse(BaseModel):
 
     run: RunRecord
     attempts: tuple[RunAttempt, ...] = ()
+    required_action: RequiredActionRecord | None = None
 
 
 class PlanDecisionResponse(BaseModel):
@@ -195,6 +198,8 @@ def create_app(
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         except IdempotencyConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RunTransitionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post(
         "/v1/conversations",
@@ -284,7 +289,11 @@ def create_app(
         principal: Annotated[Principal, Depends(authenticated_principal)],
     ) -> RunResponse:
         view = await _view(control, principal, run_id)
-        return RunResponse(run=view.run, attempts=view.attempts)
+        return RunResponse(
+            run=view.run,
+            attempts=view.attempts,
+            required_action=view.required_action,
+        )
 
     @app.get("/v1/runs/{run_id}/plan")
     async def get_plan(
@@ -362,18 +371,23 @@ def create_app(
         run_id: str,
         request: ResumeRunRequest,
         principal: Annotated[Principal, Depends(authenticated_principal)],
-    ) -> RunRecord:
+    ) -> RunResponse:
         try:
-            return await control.resume(
+            view = await control.resume(
                 principal,
                 run_id,
-                input=request.input,
+                action_id=request.action_id,
+                expected_revision=request.expected_revision,
+                response=request.response,
             )
-        except RunResumeUnsupported as exc:
-            raise HTTPException(status_code=501, detail=str(exc)) from exc
+            return RunResponse(
+                run=view.run,
+                attempts=view.attempts,
+                required_action=view.required_action,
+            )
         except RunTransitionError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except RunNotFoundError as exc:
+        except (RunNotFoundError, PlanNotFoundError) as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except RunAccessDenied as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc

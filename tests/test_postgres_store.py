@@ -24,8 +24,17 @@ from dsh_base_agent.control.models import (
     AttemptStatus,
     AuditRecord,
     ConversationRecord,
+    DispatchState,
     EventSource,
+    PlanRecord,
+    PlanStatus,
+    PlanStep,
+    RequiredActionRecord,
+    RequiredActionSource,
+    RequiredActionStatus,
+    RequiredActionType,
     RunAttempt,
+    RunPhase,
     RunRecord,
     RunStatus,
     WorkResourceType,
@@ -280,6 +289,15 @@ async def test_postgres_schema_has_migration_and_first_class_relationship_column
             """,
             postgres_store.schema,
         )
+        action_conversation_nullable = await connection.fetchval(
+            """
+            SELECT is_nullable FROM information_schema.columns
+            WHERE table_schema = $1
+              AND table_name = 'required_actions'
+              AND column_name = 'conversation_id'
+            """,
+            postgres_store.schema,
+        )
     finally:
         await connection.close()
 
@@ -287,6 +305,8 @@ async def test_postgres_schema_has_migration_and_first_class_relationship_column
         (1, "initial_control_store"),
         (2, "plan_react"),
         (3, "completed_run_phase"),
+        (4, "required_actions"),
+        (5, "plan_approval_required_actions"),
     ]
     assert {row["column_name"] for row in columns} >= {
         "conversation_id",
@@ -295,6 +315,7 @@ async def test_postgres_schema_has_migration_and_first_class_relationship_column
         "agent_fingerprint",
         "active_attempt_id",
     }
+    assert action_conversation_nullable == "YES"
 
 
 async def test_postgres_store_persists_attempt_audit_and_artifact_lifecycle(
@@ -364,6 +385,235 @@ async def test_postgres_store_persists_attempt_audit_and_artifact_lifecycle(
     assert (await postgres_store.get_run(run.run_id)).status is RunStatus.SUCCEEDED
     assert len(await postgres_store.list_audit(run.run_id)) == 1
     assert len(await postgres_store.list_artifacts(run.run_id)) == 1
+
+
+async def test_postgres_store_persists_required_action_continuation(
+    postgres_store: PostgresControlStore,
+) -> None:
+    conversation = ConversationRecord(
+        tenant_id="tenant-a",
+        principal_id="alice",
+        agent_id="orders",
+        agent_version="1.0.0",
+        agent_fingerprint="a" * 64,
+        dsh_home_key="b" * 64,
+        dsh_session_id="session-required-action",
+    )
+    await postgres_store.create_conversation(conversation)
+    queued, _ = await postgres_store.create_conversation_run(
+        conversation.conversation_id,
+        _run(input="choose shipping"),
+        idempotency_key=None,
+        request_digest="required-action-request",
+    )
+    first_attempt = RunAttempt(
+        run_id=queued.run_id,
+        number=1,
+        dsh_session_id=conversation.dsh_session_id,
+        status=AttemptStatus.RUNNING,
+    )
+    running = queued.model_copy(
+        update={
+            "status": RunStatus.RUNNING,
+            "revision": queued.revision + 1,
+            "attempt_count": 1,
+            "active_attempt_id": first_attempt.attempt_id,
+        }
+    )
+    await postgres_store.begin_attempt(
+        running,
+        first_attempt,
+        expected_run_revision=queued.revision,
+    )
+    action = RequiredActionRecord(
+        run_id=queued.run_id,
+        attempt_id=first_attempt.attempt_id,
+        conversation_id=conversation.conversation_id,
+        tenant_id="tenant-a",
+        principal_id="alice",
+        type=RequiredActionType.USER_INPUT,
+        source=RequiredActionSource.MODEL,
+        payload={
+            "questions": [
+                {
+                    "id": "shipping",
+                    "question": "Choose shipping.",
+                    "options": [{"label": "standard"}, {"label": "express"}],
+                }
+            ]
+        },
+    )
+    waiting, waiting_attempt = await postgres_store.enter_required_action(action)
+    answered = action.model_copy(
+        update={
+            "status": RequiredActionStatus.ANSWERED,
+            "response": {"answers": [{"id": "shipping", "selected": ["standard"]}]},
+            "revision": action.revision + 1,
+        }
+    )
+    queued_again = waiting.model_copy(
+        update={
+            "status": RunStatus.QUEUED,
+            "revision": waiting.revision + 1,
+            "active_attempt_id": None,
+        }
+    )
+    await postgres_store.answer_required_action(
+        queued_again,
+        answered,
+        expected_run_revision=waiting.revision,
+        expected_action_revision=action.revision,
+    )
+    second_attempt = RunAttempt(
+        run_id=queued.run_id,
+        number=2,
+        dsh_session_id=conversation.dsh_session_id,
+        status=AttemptStatus.RUNNING,
+    )
+    consumed = answered.model_copy(
+        update={
+            "status": RequiredActionStatus.CONSUMED,
+            "revision": answered.revision + 1,
+            "consumed_by_attempt_id": second_attempt.attempt_id,
+        }
+    )
+    running_again = queued_again.model_copy(
+        update={
+            "status": RunStatus.RUNNING,
+            "revision": queued_again.revision + 1,
+            "attempt_count": 2,
+            "active_attempt_id": second_attempt.attempt_id,
+            "required_action_id": None,
+        }
+    )
+    await postgres_store.begin_attempt(
+        running_again,
+        second_attempt,
+        expected_run_revision=queued_again.revision,
+        consumed_action=consumed,
+        expected_action_revision=answered.revision,
+    )
+
+    persisted_action = await postgres_store.get_required_action(action.action_id)
+    assert waiting_attempt.status is AttemptStatus.WAITING
+    assert persisted_action.status is RequiredActionStatus.CONSUMED
+    assert persisted_action.consumed_by_attempt_id == second_attempt.attempt_id
+    assert (await postgres_store.get_run(queued.run_id)).required_action_id is None
+
+
+async def test_postgres_store_atomically_resolves_plan_required_action(
+    postgres_store: PostgresControlStore,
+) -> None:
+    queued = _run(input="plan this change")
+    await postgres_store.create_run(
+        queued,
+        idempotency_key=None,
+        request_digest="plan-required-action",
+    )
+    attempt = RunAttempt(
+        run_id=queued.run_id,
+        number=1,
+        dsh_session_id="session-plan",
+        phase=RunPhase.PLANNING,
+        status=AttemptStatus.RUNNING,
+    )
+    running = queued.model_copy(
+        update={
+            "status": RunStatus.RUNNING,
+            "phase": RunPhase.PLANNING,
+            "revision": queued.revision + 1,
+            "attempt_count": 1,
+            "active_attempt_id": attempt.attempt_id,
+        }
+    )
+    await postgres_store.begin_attempt(
+        running,
+        attempt,
+        expected_run_revision=queued.revision,
+    )
+    plan = PlanRecord(
+        run_id=queued.run_id,
+        summary="Apply an approved update.",
+        steps=(PlanStep(step_id="update", task="Update the order."),),
+        requested_tools=("update_order",),
+        workflow_id="plan-react-dag",
+        workflow_version="1.0.0",
+        workflow_script_sha256="b" * 64,
+        workflow_args={"steps": []},
+        workflow_args_sha256="c" * 64,
+        plan_sha256="d" * 64,
+    )
+    action = RequiredActionRecord(
+        run_id=queued.run_id,
+        attempt_id=attempt.attempt_id,
+        tenant_id=queued.tenant_id,
+        principal_id=queued.principal_id,
+        type=RequiredActionType.PLAN_APPROVAL,
+        source=RequiredActionSource.POLICY,
+        payload={
+            "plan_id": plan.plan_id,
+            "plan_revision": plan.revision,
+            "plan_sha256": plan.plan_sha256,
+        },
+    )
+    settled_attempt = attempt.model_copy(
+        update={
+            "status": AttemptStatus.SUCCEEDED,
+            "dispatch_state": DispatchState.SETTLED,
+            "revision": attempt.revision + 1,
+        }
+    )
+    waiting = running.model_copy(
+        update={
+            "status": RunStatus.WAITING,
+            "phase": RunPhase.WAITING_APPROVAL,
+            "plan_id": plan.plan_id,
+            "required_action_id": action.action_id,
+            "revision": running.revision + 1,
+        }
+    )
+    await postgres_store.complete_planning(
+        waiting,
+        settled_attempt,
+        plan,
+        action,
+        expected_run_revision=running.revision,
+        expected_attempt_revision=attempt.revision,
+    )
+
+    decided_plan = plan.model_copy(
+        update={"status": PlanStatus.APPROVED, "revision": plan.revision + 1}
+    )
+    consumed_action = action.model_copy(
+        update={
+            "status": RequiredActionStatus.CONSUMED,
+            "response": {"decision": "approve"},
+            "revision": action.revision + 1,
+        }
+    )
+    executing = waiting.model_copy(
+        update={
+            "status": RunStatus.QUEUED,
+            "phase": RunPhase.EXECUTING,
+            "active_attempt_id": None,
+            "required_action_id": None,
+            "revision": waiting.revision + 1,
+        }
+    )
+    await postgres_store.decide_plan(
+        executing,
+        decided_plan,
+        consumed_action,
+        expected_run_revision=waiting.revision,
+        expected_plan_revision=plan.revision,
+        expected_action_revision=action.revision,
+    )
+
+    assert (await postgres_store.get_run(queued.run_id)).phase is RunPhase.EXECUTING
+    assert (await postgres_store.get_plan(queued.run_id)).status is PlanStatus.APPROVED
+    persisted_action = await postgres_store.get_required_action(action.action_id)
+    assert persisted_action.status is RequiredActionStatus.CONSUMED
+    assert persisted_action.conversation_id is None
 
 
 async def test_postgres_worker_lease_is_exclusive_and_fences_stale_worker(

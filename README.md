@@ -210,6 +210,13 @@ POST   /v1/conversations/{conversation_id}/runs
 GET    /v1/conversations/{conversation_id}/runs
 ```
 
+`/resume` 是统一 RequiredAction 决策入口：既处理 Conversation 用户回答，也处理 Plan-ReAct
+审批；`/approve` 和 `/reject` 是兼容适配接口。启用 `Agent(allow_user_input=True)` 后，模型可以通过 Host-owned
+`ask_user_question` Tool 让 Conversation Run 进入持久化 `WAITING`；调用方从 Run 查询响应读取
+`required_action`，再通过 `/resume` 提交答案。同一 Run 和 DSH Session 会创建下一个
+Attempt/Turn 继续任务。契约和边界见
+[`docs/required-actions.md`](docs/required-actions.md)。
+
 Tool 返回 JSON 超过 64 KiB 时，完整正文默认写入
 `<workspace>/.dsh-base-agent/artifacts`，SQLite/PostgreSQL 只保存 ArtifactRecord，DSH 只接收
 有界预览和引用。API/Worker 分离部署必须让二者共享该目录。配置和安全边界见
@@ -221,7 +228,8 @@ Home 和 Session ID，并在当前 ControlPlane 进程内严格串行执行。
 
 需要先规划、再人工审批、最后由 Host 确定性启动 DSH Workflow 时，在 Agent 上设置
 `plan_react=PlanReact()`。模型只提交结构化 DAG，Workflow JavaScript 使用 base-agent 固定
-模板；具体状态机、摘要校验和当前兼容边界见 [`docs/plan-react.md`](docs/plan-react.md)。
+模板；ControlPlane 会生成 `plan_approval` RequiredAction，再通过统一 `/resume` 决策。具体状态机、
+摘要校验和当前兼容边界见 [`docs/plan-react.md`](docs/plan-react.md)。
 
 ## 安全默认值
 
@@ -300,8 +308,9 @@ Agent.skills
 
 - 当前 SQLite Store 面向单控制面进程；多副本需要 PostgreSQL Store、Worker lease 和
   heartbeat。
-- 当前 DSH SDK pin 没有 Host session-resume/cancel 方法；`resume` 会明确返回不支持，取消
-  通过关闭本次 DSH Runtime 完成。后续采用 DSH 插件和版本化 JSON-RPC 扩展，设计见
+- `resume` 当前支持 Conversation Run 的持久化用户输入：旧 Turn 在提问后结束，回答会在同一
+  DSH Session 中创建新 Attempt/Turn。当前 DSH SDK pin 仍没有中断 Turn 的透明恢复或 Host
+  session-cancel 方法；后续扩展设计见
   [`docs/dsh-resume-extension.md`](docs/dsh-resume-extension.md)。
 - Conversation 支持跨 Worker 串行复用持久化 Session；替代 Worker 使用相同的
   `DSH_HOME + dsh_session_id` 处理新的 Turn，但不会恢复或自动重放被中断的原 Run。

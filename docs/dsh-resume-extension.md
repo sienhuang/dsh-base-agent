@@ -132,7 +132,8 @@ lease 或 fencing token 的 Worker 不得提交结果。
 - live approval 可以进入业务 `WAITING`，回答后原 Turn 继续；
 - Runtime 在审批等待期间退出时失败闭合，不重放未知 Tool；
 - Session、Run、审批和 Tenant/Principal 的映射经过权限校验并写入审计；
-- 未安装扩展或版本不兼容时，现有 `/resume` 继续明确返回不支持。
+- 未安装扩展或版本不兼容时，`/resume` 仍只处理 base-agent 自己的 Conversation
+  RequiredAction；需要 live approval 或中断 Turn 恢复的等待类型必须明确返回不支持。
 
 ## 8. 非目标
 

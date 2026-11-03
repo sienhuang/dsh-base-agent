@@ -24,8 +24,9 @@ agent = Agent(
 QUEUED / planning
   -> planning Attempt
   -> submit_plan(summary, steps, requested_tools)
+  -> Plan + RequiredAction(type=plan_approval, source=policy)
   -> WAITING / waiting_approval
-  -> approve（精确匹配 plan_id + revision + sha256）
+  -> /resume approve（精确匹配 action_id、Run revision、plan_id、Plan revision、sha256）
   -> QUEUED / executing
   -> execution Attempt
   -> Host JSON-RPC 直接启动固定 DSH Workflow
@@ -79,13 +80,15 @@ base-agent 内部维护版本化 Workflow 模板，把上述数据放进 `args`�
 ## API
 
 ```text
+GET  /v1/runs/{run_id}
 GET  /v1/runs/{run_id}/plan
-POST /v1/runs/{run_id}/approve
-POST /v1/runs/{run_id}/reject
+POST /v1/runs/{run_id}/resume
 ```
 
-审批/拒绝请求体必须包含刚读取到的 `plan_id`、`plan_revision` 和 `plan_sha256`，可附带
-`comment`。陈旧 revision、错误摘要、重复决定或非等待状态均返回 `409`。
+Run 查询会返回当前 `required_action`。审批/拒绝通过统一 `/resume` 接口提交 `action_id`、Run
+`expected_revision`，以及包含 `decision`、`plan_id`、`plan_revision`、`plan_sha256` 和可选
+`comment` 的 `response`。陈旧 revision、错误摘要、重复决定或非等待状态均返回 `409`。
+`/approve`、`/reject` 继续作为兼容入口存在，但内部使用同一个 RequiredAction 事务。
 
 此模式当前只支持独立 Run，不支持 Conversation。它实现的是两个 Attempt 之间可跨进程持久化
 的审批点，不是让 DSH 的一个 live Turn 暂停后再恢复。原 Turn 的 durable resume 仍属于

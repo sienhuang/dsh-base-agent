@@ -49,7 +49,7 @@ class DshProfileCompiler:
         memory_context_url: str | None = None,
         memory_context_token: str | None = None,
     ) -> tuple[Path, ...]:
-        if agent.tools and tool_gateway_url is None:
+        if (agent.tools or agent.allow_user_input) and tool_gateway_url is None:
             raise ProfileCompilationError("Agent Tools require a loopback MCP gateway")
         if agent.memory_providers and (
             memory_context_url is None or memory_context_token is None
@@ -57,8 +57,18 @@ class DshProfileCompiler:
             raise ProfileCompilationError(
                 "Agent Memory Providers require an authenticated pre-step context gateway"
             )
+        persona = agent.prompt
+        if agent.allow_user_input:
+            persona = (
+                f"{persona.rstrip()}\n\n"
+                "When essential user-owned information is missing, call "
+                "ask_user_question. Generate only the questions needed to continue. "
+                "Use options for a closed choice, omit options for free text, and set "
+                "multi_select only when several choices may be combined. After the Tool "
+                "records the request, end the turn immediately without calling another Tool."
+            )
         patches: list[dict[str, object]] = [
-            {"id": "system-prompt", "config": {"persona": agent.prompt}}
+            {"id": "system-prompt", "config": {"persona": persona}}
         ]
         patches.extend({"id": row, "disabled": True} for row in _NATIVE_TOOL_ROWS)
         if agent.skills:
